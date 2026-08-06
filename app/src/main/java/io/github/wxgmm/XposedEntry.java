@@ -257,23 +257,22 @@ public class XposedEntry extends XposedModule {
         try {
             if (INJECTED.get()) return;
             Object thiz = chain.getThisObject();
-            if (thiz == null) return; // 静态方法拿不到实例，跳过（evaluate 通常有实例）
+            // 静态方法拿不到实例（thiz == null），改用 declaringClass 找注入通道
+            Class<?> owner = thiz != null ? thiz.getClass() : method.getDeclaringClass();
             if (isReady) {
-                // 就绪回调：this 就是引擎实例（AppBrandCommonBindingJni），且引擎已创建
-                // 从同类中找 evaluateScript 作为注入通道
-                Method eval = findEvaluateMethod(thiz.getClass());
+                // 就绪回调：引擎已创建，从声明类中找 evaluateScript 作为注入通道
+                Method eval = findEvaluateMethod(owner);
                 if (eval == null) {
-                    log(Log.WARN, TAG, "ready callback but no evaluate method in "
-                            + thiz.getClass().getName());
+                    log(Log.WARN, TAG, "ready callback but no evaluate method in " + owner.getName());
                     return;
                 }
-                sEngineInstance = thiz;
+                sEngineInstance = thiz; // static 回调时为 null，injectOnce 会走静态注入
                 sEvaluateMethod = eval;
                 log(Log.INFO, TAG, "engine captured via ready callback: " + method.getName()
                         + " -> " + eval.getName());
                 scheduleInject();
             } else {
-                // evaluate 方法本身：this 是引擎实例，method 即注入通道
+                // evaluate 方法本身：method 即注入通道
                 sEngineInstance = thiz;
                 sEvaluateMethod = method;
                 log(Log.INFO, TAG, "engine captured: " + method.getDeclaringClass().getName()
