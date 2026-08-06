@@ -32,6 +32,8 @@ public class XposedEntry extends XposedModule {
     private static final String[] CANDIDATE_CLASSES = {
             // 真机日志确认：微信 8.0.76 实际 JS 求值入口（commonjni）
             "com.tencent.mm.appbrand.commonjni.AppBrandCommonBindingJni",
+            // AppBrandCommonBindingJni 静态初始化前置：CsoLoader（Missing initialization 提示）
+            "com.tencent.mm.appbrand.commonjni.CsoLoader",
             "com.tencent.mm.plugin.appbrand.jsruntime.AppBrandJsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.JsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.e",
@@ -155,7 +157,8 @@ public class XposedEntry extends XposedModule {
                         if (name == null) continue;
                         String lower = name.toLowerCase();
                         if (!(lower.contains("appbrand") || lower.contains("jsruntime")
-                                || lower.contains("jsbridge") || lower.contains("jscore"))) continue;
+                                || lower.contains("jsbridge") || lower.contains("jscore")
+                                || lower.contains("cso") || lower.contains("csoloader"))) continue;
                         matched++;
                         log(Log.INFO, TAG, "[" + tag + "] class: " + name);
                         if (matched > 300) break;
@@ -225,46 +228,90 @@ public class XposedEntry extends XposedModule {
     }
 
     // ------------------------------------------------------------------
-    // 尝试 hook 候选类
+    // 尝试 hook 候选类（false 加载 + 显式激活）
     // ------------------------------------------------------------------
     private void tryHookClass(String className, ClassLoader cl) {
         try {
-            // initialize=true：执行静态初始化，ArtMethod 才真正就绪。
-            // initialize=false 是伪成功（hook 注册了但从不触发）。
-            Class<?> clazz = Class.forName(className, true, cl);
+            // initialize=false：只加载不初始化（clinit 不执行）。
+            // hook 会注册，但 ArtMethod 未初始化，拦截器不触发（伪成功）。
+            // 必须显式激活：见 hookCsoLoader + activatePending。
+            Class<?> clazz = Class.forName(className, false, cl);
             log(Log.INFO, TAG, "[candidate] found: " + className);
             tryHookClassMethods(clazz);
+            PENDING_ACTIVATE.add(className);
+            // 事件驱动：hook CsoLoader.initialize 的 after，CsoLoader 就绪即激活
+            hookCsoLoader(cl);
+            // 轮询兜底：CsoLoader 最终会被微信初始化，轮询触发 clinit
+            scheduleActivateRetry(className, cl);
         } catch (Throwable t) {
-            String msg = String.valueOf(t.getMessage());
-            log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + msg);
-            // CsoLoader 前置未就绪（AppBrandCommonBindingJni 是微信 JNI 绑定类，
-            // 静态初始化需要 CsoLoader.initialize 先执行）：延迟重试，微信随后会初始化它
-            if (msg.contains("CsoLoader") || msg.contains("Missing initialization")) {
-                scheduleCsoRetry(className, cl);
+            log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + t.getMessage());
+        }
+    }
+
+    /** 待激活类（false 加载但 clinit 未执行），CsoLoader 就绪后显式激活 */
+    private static final Set<String> PENDING_ACTIVATE = new HashSet<>();
+    private static volatile boolean CSO_HOOKED = false;
+
+    /** hook CsoLoader.initialize 的 after 回调：CsoLoader 就绪后激活待激活类 */
+    private void hookCsoLoader(ClassLoader cl) {
+        if (CSO_HOOKED) return;
+        String[] csoCandidates = {
+                "com.tencent.mm.appbrand.commonjni.CsoLoader",
+        };
+        for (String cn : csoCandidates) {
+            try {
+                Class<?> cso = Class.forName(cn, false, cl);
+                for (Method m : cso.getDeclaredMethods()) {
+                    if (m.getName().equals("initialize")) {
+                        hook(m).intercept(chain -> {
+                            Object result = chain.proceed();
+                            activatePending(cl);
+                            return result;
+                        });
+                        CSO_HOOKED = true;
+                        log(Log.INFO, TAG, "[cso] hooked initialize: " + cn);
+                        return;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        log(Log.WARN, TAG, "[cso] CsoLoader.initialize not found, relying on poll retry");
+    }
+
+    /** 显式激活：对待激活类执行 Class.forName(initialize=true) 触发 clinit */
+    private void activatePending(ClassLoader cl) {
+        for (String cn : new HashSet<>(PENDING_ACTIVATE)) {
+            try {
+                Class<?> clazz = Class.forName(cn, true, cl); // 触发 clinit
+                PENDING_ACTIVATE.remove(cn);
+                log(Log.INFO, TAG, "[activate] clinit done: " + cn);
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "[activate] fail " + cn + ": " + t.getMessage());
             }
         }
     }
 
-    /** CsoLoader 就绪后延迟重试（最多 60 秒），成功后 hook 到真正初始化的类 */
-    private void scheduleCsoRetry(String className, ClassLoader cl) {
+    /** CsoLoader 就绪后轮询激活（最多 60 秒），兜底方案 */
+    private void scheduleActivateRetry(String className, ClassLoader cl) {
         Thread t = new Thread(() -> {
             try {
                 for (int i = 0; i < 30; i++) {
                     Thread.sleep(2000);
                     try {
-                        Class<?> clazz = Class.forName(className, true, cl);
-                        log(Log.INFO, TAG, "[cso-retry] init success after "
+                        Class<?> clazz = Class.forName(className, true, cl); // 触发 clinit
+                        PENDING_ACTIVATE.remove(className);
+                        log(Log.INFO, TAG, "[activate-retry] clinit done after "
                                 + ((i + 1) * 2) + "s: " + className);
-                        tryHookClassMethods(clazz);
                         return;
                     } catch (Throwable ignored) {
                         // CsoLoader 还未就绪，继续等
                     }
                 }
-                log(Log.WARN, TAG, "[cso-retry] give up: " + className);
+                log(Log.WARN, TAG, "[activate-retry] give up: " + className);
             } catch (Throwable ignored) {
             }
-        }, "wxgm-csoretry");
+        }, "wxgm-activate");
         t.setDaemon(true);
         t.start();
     }
