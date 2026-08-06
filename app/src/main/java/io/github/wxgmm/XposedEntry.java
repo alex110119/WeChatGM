@@ -158,7 +158,7 @@ public class XposedEntry extends XposedModule {
                         log(Log.INFO, TAG, "[" + tag + "] class: " + name);
                         if (matched > 300) break;
                         try {
-                            Class<?> clazz = Class.forName(name, false, cl);
+                            Class<?> clazz = Class.forName(name, true, cl);
                             if (clazz != null) tryHookClassMethods(clazz);
                         } catch (Throwable ignored) {
                         }
@@ -224,7 +224,8 @@ public class XposedEntry extends XposedModule {
     // ------------------------------------------------------------------
     private void tryHookClass(String className, ClassLoader cl) {
         try {
-            Class<?> clazz = Class.forName(className, false, cl);
+            // 官方 example 用 initialize=true（执行静态初始化），对齐之
+            Class<?> clazz = Class.forName(className, true, cl);
             log(Log.INFO, TAG, "[candidate] found: " + className);
             tryHookClassMethods(clazz);
         } catch (Throwable t) {
@@ -276,9 +277,8 @@ public class XposedEntry extends XposedModule {
             if (pts.length == 0 || (pts[0] != String.class && !isReady)) continue;
             if (!isReady && !matchesEvaluateName(mn) && pts.length > 2) continue;
             try {
+                // 官方 example 写法：hook(method).intercept(chain -> ...)，不额外设置 exceptionMode
                 hook(m)
-                        .setPriority(XposedInterface.PRIORITY_DEFAULT)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .intercept(chain -> {
                             Object result = chain.proceed();
                             captureEngineAndInject(chain, m, isReady);
