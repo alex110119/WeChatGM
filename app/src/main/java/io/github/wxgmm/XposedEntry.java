@@ -55,6 +55,8 @@ public class XposedEntry extends XposedModule {
     private static final AtomicBoolean INJECTED = new AtomicBoolean(false);
     /** 记录已 hook 的类，避免重复 */
     private static final Set<String> HOOKED_CLASSES = new HashSet<>();
+    /** 限流调用日志：记录已打印过 [called] 的方法，避免刷屏 */
+    private static final Set<String> CALL_LOG = new HashSet<>();
 
     private static volatile Object sEngineInstance;   // JS 引擎实例
     private static volatile Method sEvaluateMethod;   // 引擎的 evaluate 方法
@@ -314,6 +316,11 @@ public class XposedEntry extends XposedModule {
                 // 官方 example 写法：hook(method).intercept(chain -> ...)，不额外设置 exceptionMode
                 hook(m)
                         .intercept(chain -> {
+                            // 限流调用日志：每个方法首次被调用时打印，验证 hook 机制是否生效
+                            if (CALL_LOG.add(clazz.getName() + "." + mn)) {
+                                log(Log.INFO, TAG, "[called] " + clazz.getName() + "." + mn
+                                        + (isReady ? " (ready)" : ""));
+                            }
                             Object result = chain.proceed();
                             captureEngineAndInject(chain, m, isReady);
                             return result;
