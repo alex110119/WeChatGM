@@ -299,7 +299,11 @@ public class XposedEntry extends XposedModule {
                     });
             log(Log.INFO, TAG, "[STEP-6] clinit-hook registered: " + clazz.getName());
         } catch (Throwable t) {
-            log(Log.DEBUG, TAG, "[clinit-hook] fail " + clazz.getName() + ": " + t.getMessage());
+            // ★ ERROR + 完整堆栈：DEBUG 会被 LSPosed 过滤、getMessage() 可能为 null
+            //   （如 NoSuchMethodError: <clinit> 不存在/已执行完），导致看不到真实报错
+            log(Log.ERROR, TAG, "[clinit-hook] fail " + clazz.getName() + " -> "
+                    + t.getClass().getName() + ": " + t.getMessage());
+            log(Log.ERROR, TAG, Log.getStackTraceString(t));
         }
     }
 
@@ -343,9 +347,11 @@ public class XposedEntry extends XposedModule {
             String mn = m.getName();
             Class<?>[] pts = m.getParameterTypes();
             boolean isReady = matchesReadyName(mn);
-            // 宽松匹配：方法名像 evaluate，或第一个参数是 String（混淆后 evaluate 类方法通常第一个参数是 JS 代码字符串），或引擎就绪回调
-            if (pts.length == 0 || (pts[0] != String.class && !isReady)) continue;
-            if (!isReady && !matchesEvaluateName(mn) && pts.length > 2) continue;
+            boolean isEval = matchesEvaluateName(mn);
+            // ★ 过滤条件：只按方法名过滤，不再用 pts[0] != String 硬性要求——
+            //   mmv8/J2V8 的 execute*Script 第一个参数可能是 runtime/context 句柄(long)，
+            //   脚本字符串在第二位，若按参数类型过滤会把真正的方法全 continue 掉（STEP-8=0 的根因）
+            if (!isReady && !isEval) continue;
             try {
                 // 官方 example 写法：hook(method).intercept(chain -> ...)，不额外设置 exceptionMode
                 hook(m)
@@ -361,7 +367,10 @@ public class XposedEntry extends XposedModule {
                         });
                 log(Log.INFO, TAG, "[STEP-8] hook: " + clazz.getName() + "." + mn + (isReady ? " (ready)" : ""));
             } catch (Throwable t) {
-                log(Log.DEBUG, TAG, "[hook] fail " + clazz.getName() + "." + mn + ": " + t.getMessage());
+                // ★ ERROR + 完整堆栈：DEBUG 会被 LSPosed 过滤、getMessage() 可能为 null，导致看不到真实报错
+                log(Log.ERROR, TAG, "[hook] fail " + clazz.getName() + "." + mn + " -> "
+                        + t.getClass().getName() + ": " + t.getMessage());
+                log(Log.ERROR, TAG, Log.getStackTraceString(t));
             }
         }
     }
@@ -460,9 +469,21 @@ public class XposedEntry extends XposedModule {
         try {
             Class<?>[] pts = m.getParameterTypes();
             Object[] args = new Object[pts.length];
-            args[0] = PAYLOAD;
-            // 其余参数尽量给默认值（url/scriptName 等）
-            for (int i = 1; i < pts.length; i++) {
+            // ★ 找到第一个 String 参数位置注入 PAYLOAD——mmv8/J2V8 的 execute*Script
+            //   第一个参数可能是 runtime/context 句柄(long)，脚本字符串在第二位
+            int scriptIdx = -1;
+            for (int i = 0; i < pts.length; i++) {
+                if (pts[i] == String.class) { scriptIdx = i; break; }
+            }
+            if (scriptIdx < 0) {
+                log(Log.ERROR, TAG, "[STEP-11] inject abort: no String param in " + m.getName());
+                INJECTED.set(false);
+                return;
+            }
+            args[scriptIdx] = PAYLOAD;
+            // 其余参数尽量给默认值（url/scriptName/句柄等）
+            for (int i = 0; i < pts.length; i++) {
+                if (i == scriptIdx) continue;
                 Class<?> p = pts[i];
                 if (p == String.class) args[i] = "";
                 else if (p == boolean.class) args[i] = false;
@@ -472,7 +493,7 @@ public class XposedEntry extends XposedModule {
             }
             try { m.setAccessible(true); } catch (Throwable ignored) {}
             m.invoke(isStatic ? null : engine, args);
-            log(Log.INFO, TAG, "[STEP-11] payload injected via " + m.getName());
+            log(Log.INFO, TAG, "[STEP-11] payload injected via " + m.getName() + " scriptIdx=" + scriptIdx);
         } catch (Throwable t) {
             INJECTED.set(false);
             log(Log.ERROR, TAG, "[STEP-11] inject failed: " + t + " (will retry)");
