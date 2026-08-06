@@ -77,7 +77,17 @@ public class XposedEntry extends XposedModule {
     // ------------------------------------------------------------------
     private void hookClassLoaderProbe() {
         try {
-            Method loadClass = ClassLoader.class.getDeclaredMethod("loadClass", String.class);
+            // 微信自定义 classloader 可能重写 loadClass(String, boolean)，两个重载都 hook
+            hookLoadClassOverload(ClassLoader.class.getDeclaredMethod("loadClass", String.class));
+            hookLoadClassOverload(ClassLoader.class.getDeclaredMethod("loadClass", String.class, boolean.class));
+            log(Log.INFO, TAG, "ClassLoader.loadClass hooked for probe (both overloads)");
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hookClassLoaderProbe failed: " + t);
+        }
+    }
+
+    private void hookLoadClassOverload(Method loadClass) {
+        try {
             hook(loadClass)
                     .setPriority(XposedInterface.PRIORITY_DEFAULT)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -85,7 +95,7 @@ public class XposedEntry extends XposedModule {
                         Object result = chain.proceed();
                         try {
                             String name = String.valueOf(chain.getArg(0));
-                            if (isJsRuntimeClass(name) && HOOKED_CLASSES.add(name)) {
+                            if (isJsRuntimeClass(name) && HOOKED_CLASSES.add("cls:" + name)) {
                                 log(Log.INFO, TAG, "[probe] loaded class: " + name);
                                 if (result instanceof Class) {
                                     tryHookClassMethods((Class<?>) result);
@@ -95,9 +105,8 @@ public class XposedEntry extends XposedModule {
                         }
                         return result;
                     });
-            log(Log.INFO, TAG, "ClassLoader.loadClass hooked for probe");
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hookClassLoaderProbe failed: " + t);
+            log(Log.ERROR, TAG, "hookLoadClassOverload failed: " + t);
         }
     }
 
@@ -123,12 +132,28 @@ public class XposedEntry extends XposedModule {
     }
 
     private void tryHookClassMethods(Class<?> clazz) {
-        if (clazz == null || !HOOKED_CLASSES.add(clazz.getName())) return;
+        if (clazz == null || !HOOKED_CLASSES.add("mtd:" + clazz.getName())) return;
+        // dump 所有方法签名，方便定位真实混淆名
+        for (Method m : clazz.getDeclaredMethods()) {
+            try {
+                StringBuilder sb = new StringBuilder();
+                sb.append(m.getName()).append('(');
+                Class<?>[] pts = m.getParameterTypes();
+                for (int i = 0; i < pts.length; i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(pts[i].getSimpleName());
+                }
+                sb.append(')');
+                log(Log.INFO, TAG, "[dump] " + clazz.getName() + "." + sb);
+            } catch (Throwable ignored) {
+            }
+        }
         for (Method m : clazz.getDeclaredMethods()) {
             String mn = m.getName();
-            if (!matchesEvaluateName(mn)) continue;
             Class<?>[] pts = m.getParameterTypes();
+            // 宽松匹配：方法名像 evaluate，或第一个参数是 String（混淆后 evaluate 类方法通常第一个参数是 JS 代码字符串）
             if (pts.length == 0 || pts[0] != String.class) continue;
+            if (!matchesEvaluateName(mn) && pts.length > 2) continue;
             try {
                 hook(m)
                         .setPriority(XposedInterface.PRIORITY_DEFAULT)
