@@ -254,7 +254,7 @@ public class XposedEntry extends XposedModule {
     private static final Set<String> PENDING_ACTIVATE = new HashSet<>();
     private static volatile boolean CSO_HOOKED = false;
 
-    /** hook CsoLoader 的 Java static 方法（after 回调）：CsoLoader 初始化时激活待激活类 */
+    /** hook CsoLoader 的方法（after 回调）：CsoLoader 初始化时激活待激活类 */
     private void hookCsoLoader(ClassLoader cl) {
         if (CSO_HOOKED) return;
         String[] csoCandidates = {
@@ -266,10 +266,10 @@ public class XposedEntry extends XposedModule {
                 Class<?> cso = Class.forName(cn, false, cl);
                 int hooked = 0;
                 for (Method m : cso.getDeclaredMethods()) {
-                    // native 方法 Java 层 hook 不到，跳过；hook 所有 Java static 方法
-                    // （d(...) 是 nativeInitialize 的封装，初始化入口；e/g/h/i 也常被调用）
+                    // native 方法 Java 层 hook 不到，跳过；
+                    // 注意：不限制 static——d(...) 是 nativeInitialize 的 Java 封装（实例方法），
+                    // 是 AppBrandCommonBindingJni clinit 要求的 "CsoLoader.initialize" 本体
                     if (java.lang.reflect.Modifier.isNative(m.getModifiers())) continue;
-                    if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
                     try {
                         hook(m).intercept(chain -> {
                             Object result = chain.proceed();
@@ -382,6 +382,10 @@ public class XposedEntry extends XposedModule {
                                         + (isReady ? " (ready)" : ""));
                             }
                             Object result = chain.proceed();
+                            // CsoLoader 的任何方法被调用 → CsoLoader 初始化进行中 → 立即激活待激活类
+                            if (isCsoLoaderClass(clazz.getName())) {
+                                activatePending(clazz.getClassLoader());
+                            }
                             captureEngineAndInject(chain, m, isReady);
                             return result;
                         });
@@ -390,6 +394,10 @@ public class XposedEntry extends XposedModule {
                 log(Log.DEBUG, TAG, "[hook] fail " + clazz.getName() + "." + mn + ": " + t.getMessage());
             }
         }
+    }
+
+    private boolean isCsoLoaderClass(String name) {
+        return name != null && name.contains("CsoLoader");
     }
 
     private boolean matchesReadyName(String name) {
