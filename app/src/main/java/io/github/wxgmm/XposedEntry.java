@@ -30,6 +30,8 @@ public class XposedEntry extends XposedModule {
 
     /** 候选 JS 引擎类（版本相关，找不到会跳过并记录日志） */
     private static final String[] CANDIDATE_CLASSES = {
+            // 真机日志确认：微信 8.0.76 实际 JS 求值入口（commonjni）
+            "com.tencent.mm.appbrand.commonjni.AppBrandCommonBindingJni",
             "com.tencent.mm.plugin.appbrand.jsruntime.AppBrandJsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.JsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.e",
@@ -263,8 +265,12 @@ public class XposedEntry extends XposedModule {
         if (!INJECTED.compareAndSet(false, true)) return;
         Method m = sEvaluateMethod;
         Object engine = sEngineInstance;
-        if (m == null || engine == null) {
-            log(Log.WARN, TAG, "inject aborted: no engine captured yet");
+        boolean isStatic = m != null && java.lang.reflect.Modifier.isStatic(m.getModifiers());
+        if (m == null || (!isStatic && engine == null)) {
+            // 还没捕获到引擎实例：重置标志，稍后重试（最多 3 次）
+            INJECTED.set(false);
+            log(Log.WARN, TAG, "inject retry: no engine captured yet, static=" + isStatic);
+            scheduleInject();
             return;
         }
         try {
@@ -281,10 +287,12 @@ public class XposedEntry extends XposedModule {
                 else args[i] = null;
             }
             try { m.setAccessible(true); } catch (Throwable ignored) {}
-            m.invoke(engine, args);
+            m.invoke(isStatic ? null : engine, args);
             log(Log.INFO, TAG, "payload injected via " + m.getName());
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "inject failed: " + t);
+            INJECTED.set(false);
+            log(Log.ERROR, TAG, "inject failed: " + t + " (will retry)");
+            scheduleInject();
         }
     }
 
