@@ -33,7 +33,8 @@ public class XposedEntry extends XposedModule {
             // 真机日志确认：微信 8.0.76 实际 JS 求值入口（commonjni）
             "com.tencent.mm.appbrand.commonjni.AppBrandCommonBindingJni",
             // AppBrandCommonBindingJni 静态初始化前置：CsoLoader（Missing initialization 提示）
-            "com.tencent.mm.appbrand.commonjni.CsoLoader",
+            // 日志确认真实类名：com.tencent.cso.CsoLoader（不在 commonjni 包！）
+            "com.tencent.cso.CsoLoader",
             "com.tencent.mm.plugin.appbrand.jsruntime.AppBrandJsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.JsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.e",
@@ -252,31 +253,42 @@ public class XposedEntry extends XposedModule {
     private static final Set<String> PENDING_ACTIVATE = new HashSet<>();
     private static volatile boolean CSO_HOOKED = false;
 
-    /** hook CsoLoader.initialize 的 after 回调：CsoLoader 就绪后激活待激活类 */
+    /** hook CsoLoader 的 Java static 方法（after 回调）：CsoLoader 初始化时激活待激活类 */
     private void hookCsoLoader(ClassLoader cl) {
         if (CSO_HOOKED) return;
         String[] csoCandidates = {
-                "com.tencent.mm.appbrand.commonjni.CsoLoader",
+                // 日志确认真实类名（不在 commonjni 包）
+                "com.tencent.cso.CsoLoader",
         };
         for (String cn : csoCandidates) {
             try {
                 Class<?> cso = Class.forName(cn, false, cl);
+                int hooked = 0;
                 for (Method m : cso.getDeclaredMethods()) {
-                    if (m.getName().equals("initialize")) {
+                    // native 方法 Java 层 hook 不到，跳过；hook 所有 Java static 方法
+                    // （d(...) 是 nativeInitialize 的封装，初始化入口；e/g/h/i 也常被调用）
+                    if (java.lang.reflect.Modifier.isNative(m.getModifiers())) continue;
+                    if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                    try {
                         hook(m).intercept(chain -> {
                             Object result = chain.proceed();
                             activatePending(cl);
                             return result;
                         });
-                        CSO_HOOKED = true;
-                        log(Log.INFO, TAG, "[cso] hooked initialize: " + cn);
-                        return;
+                        hooked++;
+                        log(Log.INFO, TAG, "[cso] hooked: " + cn + "." + m.getName());
+                    } catch (Throwable ignored) {
                     }
+                }
+                if (hooked > 0) {
+                    CSO_HOOKED = true;
+                    log(Log.INFO, TAG, "[cso] CsoLoader hooked, methods=" + hooked);
+                    return;
                 }
             } catch (Throwable ignored) {
             }
         }
-        log(Log.WARN, TAG, "[cso] CsoLoader.initialize not found, relying on poll retry");
+        log(Log.WARN, TAG, "[cso] CsoLoader not found, relying on poll retry");
     }
 
     /** 显式激活：对待激活类执行 Class.forName(initialize=true) 触发 clinit */
