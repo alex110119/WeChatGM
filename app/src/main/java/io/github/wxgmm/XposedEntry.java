@@ -169,7 +169,13 @@ public class XposedEntry extends XposedModule {
                             // 初始化失败状态，后续 tryHookClass 的 false 加载也会失败）。
                             // 真正的激活由 hookCsoLoader → activatePending 显式触发。
                             Class<?> clazz = Class.forName(name, false, cl);
-                            if (clazz != null) tryHookClassMethods(clazz);
+                            if (clazz != null) {
+                                tryHookClassMethods(clazz);
+                                // 与 tryHookClass 一致：false 加载的类必须登记待激活 + 挂 CsoLoader 钩子 + 轮询兜底
+                                PENDING_ACTIVATE.add(name);
+                                hookCsoLoader(cl);
+                                scheduleActivateRetry(name, cl);
+                            }
                         } catch (Throwable ignored) {
                         }
                     }
