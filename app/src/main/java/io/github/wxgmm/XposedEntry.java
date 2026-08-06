@@ -64,11 +64,65 @@ public class XposedEntry extends XposedModule {
         log(Log.INFO, TAG, "WeChat loaded, first=" + param.isFirstPackage());
         sAppClassLoader = param.getDefaultClassLoader();
 
-        // 1) 探测：hook ClassLoader.loadClass 记录 appbrand/v8/js 相关类名
+        // 1) 静态扫描：枚举微信 APK 中 AppBrand/JS 相关类，dump 签名并尝试 hook
+        scanAppBrandClasses(param);
+        // 2) 探测：hook ClassLoader.loadClass 记录 appbrand/v8/js 相关类名
         hookClassLoaderProbe();
-        // 2) 尝试候选类
+        // 3) 尝试候选类
         for (String cn : CANDIDATE_CLASSES) {
             tryHookClass(cn);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 静态扫描：DexFile 枚举微信 APK 全部类名，过滤 AppBrand/JS 相关类
+    // ------------------------------------------------------------------
+    private void scanAppBrandClasses(PackageLoadedParam param) {
+        try {
+            android.content.pm.ApplicationInfo ai = param.getApplicationInfo();
+            if (ai == null) {
+                log(Log.WARN, TAG, "[scan] no applicationInfo");
+                return;
+            }
+            java.util.List<String> dexPaths = new java.util.ArrayList<>();
+            if (ai.sourceDir != null) dexPaths.add(ai.sourceDir);
+            if (ai.splitSourceDirs != null) {
+                for (String s : ai.splitSourceDirs) {
+                    if (s != null) dexPaths.add(s);
+                }
+            }
+            log(Log.INFO, TAG, "[scan] dex count=" + dexPaths.size());
+            Thread t = new Thread(() -> {
+                int matched = 0;
+                for (String dexPath : dexPaths) {
+                    try {
+                        dalvik.system.DexFile dex = new dalvik.system.DexFile(dexPath);
+                        java.util.Enumeration<String> entries = dex.entries();
+                        while (entries.hasMoreElements()) {
+                            String name = entries.nextElement();
+                            if (name == null) continue;
+                            String lower = name.toLowerCase();
+                            if (!(lower.contains("appbrand") || lower.contains("jsruntime")
+                                    || lower.contains("jsbridge") || lower.contains("jscore"))) continue;
+                            matched++;
+                            log(Log.INFO, TAG, "[scan] class: " + name);
+                            if (matched > 300) break;
+                            try {
+                                Class<?> clazz = Class.forName(name, false, sAppClassLoader);
+                                if (clazz != null) tryHookClassMethods(clazz);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        dex.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                log(Log.INFO, TAG, "[scan] done, matched=" + matched);
+            }, "wxgm-scan");
+            t.setDaemon(true);
+            t.start();
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "[scan] init failed: " + t);
         }
     }
 
