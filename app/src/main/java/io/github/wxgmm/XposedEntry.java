@@ -67,7 +67,7 @@ public class XposedEntry extends XposedModule {
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
-        log(Log.INFO, TAG, "module loaded, pid=" + param.getProcessName());
+        log(Log.INFO, TAG, "[STEP-1] module loaded, pid=" + param.getProcessName());
     }
 
     @Override
@@ -75,7 +75,7 @@ public class XposedEntry extends XposedModule {
         if (!TARGET_PACKAGE.equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "WeChat loaded, first=" + param.isFirstPackage());
+        log(Log.INFO, TAG, "[STEP-2] package loaded, first=" + param.isFirstPackage());
         sAppClassLoader = param.getDefaultClassLoader();
 
         // 1) 静态扫描：枚举微信 APK 中 AppBrand/JS 相关类，dump 签名并尝试 hook
@@ -98,7 +98,7 @@ public class XposedEntry extends XposedModule {
         // 之前用 default classloader 加载的类副本可能不是运行时实际使用的，
         // 导致 hook 静默注册成功但不触发（API 101+ 的坑）。
         ClassLoader finalCl = param.getClassLoader();
-        log(Log.INFO, TAG, "WeChat ready, re-hook with final classloader: "
+        log(Log.INFO, TAG, "[STEP-3] package ready, re-hook with final classloader: "
                 + System.identityHashCode(finalCl));
         sAppClassLoader = finalCl;
         for (String cn : CANDIDATE_CLASSES) {
@@ -149,6 +149,7 @@ public class XposedEntry extends XposedModule {
         log(Log.INFO, TAG, "[" + tag + "] dex count=" + dexPaths.size());
         Thread t = new Thread(() -> {
             int matched = 0;
+            log(Log.INFO, TAG, "[STEP-4] scanDex start, tag=" + tag + " dex=" + dexPaths.size());
             for (String dexPath : dexPaths) {
                 try {
                     dalvik.system.DexFile dex = new dalvik.system.DexFile(dexPath);
@@ -240,11 +241,12 @@ public class XposedEntry extends XposedModule {
             // CsoLoader 未就绪时主动触发会把类永久标记为 NoClassDefFoundError，
             // 导致微信自己初始化也失败。激活完全交给 hookClassInitializer。
             Class<?> clazz = Class.forName(className, false, cl);
-            log(Log.INFO, TAG, "[candidate] found: " + className);
+            log(Log.INFO, TAG, "[STEP-5] tryHookClass found: " + className
+                    + " loader=" + System.identityHashCode(cl));
             tryHookClassMethods(clazz);      // 预注册 hook（若类已初始化则直接生效）
             hookClassInitializerFor(clazz);  // 关键：等微信自己初始化该类后再重新 hook
         } catch (Throwable t) {
-            log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + t.getMessage());
+            log(Log.DEBUG, TAG, "[STEP-5] tryHookClass skip " + className + ": " + t.getMessage());
         }
     }
 
@@ -256,7 +258,7 @@ public class XposedEntry extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept(chain -> {
                         // 关键触发日志：拦截器执行 = clinit 真的被微信触发了（区别于仅注册成功）
-                        log(Log.INFO, TAG, "[clinit-triggered] BEFORE " + clazz.getName()
+                        log(Log.INFO, TAG, "[STEP-7] clinit-triggered BEFORE " + clazz.getName()
                                 + " loader=" + System.identityHashCode(clazz.getClassLoader()));
                         Object result;
                         try {
@@ -271,7 +273,7 @@ public class XposedEntry extends XposedModule {
                             throw t; // 继续抛出，不影响微信自身初始化流程
                         }
                         // clinit 成功：类已初始化、ArtMethod 就绪——移除去重标记并重新 hook
-                        log(Log.INFO, TAG, "[clinit-triggered] AFTER " + clazz.getName() + " (clinit done)");
+                        log(Log.INFO, TAG, "[STEP-7] clinit-triggered AFTER " + clazz.getName() + " (clinit done)");
                         ClassLoader loader = clazz.getClassLoader();
                         String key = "mtd:" + clazz.getName() + "@"
                                 + (loader != null ? System.identityHashCode(loader) : 0);
@@ -279,7 +281,7 @@ public class XposedEntry extends XposedModule {
                         tryHookClassMethods(clazz);
                         return result;
                     });
-            log(Log.INFO, TAG, "[clinit-hook] " + clazz.getName());
+            log(Log.INFO, TAG, "[STEP-6] clinit-hook registered: " + clazz.getName());
         } catch (Throwable t) {
             log(Log.DEBUG, TAG, "[clinit-hook] fail " + clazz.getName() + ": " + t.getMessage());
         }
@@ -334,14 +336,14 @@ public class XposedEntry extends XposedModule {
                         .intercept(chain -> {
                             // 限流调用日志：每个方法首次被调用时打印，验证 hook 机制是否生效
                             if (CALL_LOG.add(clazz.getName() + "." + mn)) {
-                                log(Log.INFO, TAG, "[called] " + clazz.getName() + "." + mn
+                                log(Log.INFO, TAG, "[STEP-9] called: " + clazz.getName() + "." + mn
                                         + (isReady ? " (ready)" : ""));
                             }
                             Object result = chain.proceed();
                             captureEngineAndInject(chain, m, isReady);
                             return result;
                         });
-                log(Log.INFO, TAG, "[hook] " + clazz.getName() + "." + mn + (isReady ? " (ready)" : ""));
+                log(Log.INFO, TAG, "[STEP-8] hook: " + clazz.getName() + "." + mn + (isReady ? " (ready)" : ""));
             } catch (Throwable t) {
                 log(Log.DEBUG, TAG, "[hook] fail " + clazz.getName() + "." + mn + ": " + t.getMessage());
             }
@@ -382,14 +384,14 @@ public class XposedEntry extends XposedModule {
                 }
                 sEngineInstance = thiz; // static 回调时为 null，injectOnce 会走静态注入
                 sEvaluateMethod = eval;
-                log(Log.INFO, TAG, "engine captured via ready callback: " + method.getName()
+                log(Log.INFO, TAG, "[STEP-10] engine captured via ready callback: " + method.getName()
                         + " -> " + eval.getName());
                 scheduleInject();
             } else {
                 // evaluate 方法本身：method 即注入通道
                 sEngineInstance = thiz;
                 sEvaluateMethod = method;
-                log(Log.INFO, TAG, "engine captured: " + method.getDeclaringClass().getName()
+                log(Log.INFO, TAG, "[STEP-10] engine captured: " + method.getDeclaringClass().getName()
                         + "." + method.getName());
                 scheduleInject();
             }
@@ -435,7 +437,7 @@ public class XposedEntry extends XposedModule {
         if (m == null || (!isStatic && engine == null)) {
             // 还没捕获到引擎实例：重置标志，稍后重试（最多 3 次）
             INJECTED.set(false);
-            log(Log.WARN, TAG, "inject retry: no engine captured yet, static=" + isStatic);
+            log(Log.WARN, TAG, "[STEP-11] inject retry: no engine captured yet, static=" + isStatic);
             scheduleInject();
             return;
         }
@@ -454,10 +456,10 @@ public class XposedEntry extends XposedModule {
             }
             try { m.setAccessible(true); } catch (Throwable ignored) {}
             m.invoke(isStatic ? null : engine, args);
-            log(Log.INFO, TAG, "payload injected via " + m.getName());
+            log(Log.INFO, TAG, "[STEP-11] payload injected via " + m.getName());
         } catch (Throwable t) {
             INJECTED.set(false);
-            log(Log.ERROR, TAG, "inject failed: " + t + " (will retry)");
+            log(Log.ERROR, TAG, "[STEP-11] inject failed: " + t + " (will retry)");
             scheduleInject();
         }
     }
