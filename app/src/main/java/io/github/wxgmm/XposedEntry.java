@@ -201,10 +201,7 @@ public class XposedEntry extends XposedModule {
                 else if (p == long.class) args[i] = 0L;
                 else args[i] = null;
             }
-            boolean acc = m.canAccess(engine);
-            if (!acc) {
-                try { m.setAccessible(true); } catch (Throwable ignored) {}
-            }
+            try { m.setAccessible(true); } catch (Throwable ignored) {}
             m.invoke(engine, args);
             log(Log.INFO, TAG, "payload injected via " + m.getName());
         } catch (Throwable t) {
