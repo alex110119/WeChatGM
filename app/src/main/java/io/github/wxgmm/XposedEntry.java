@@ -255,6 +255,9 @@ public class XposedEntry extends XposedModule {
                     .setPriority(XposedInterface.PRIORITY_DEFAULT)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept(chain -> {
+                        // 关键触发日志：拦截器执行 = clinit 真的被微信触发了（区别于仅注册成功）
+                        log(Log.INFO, TAG, "[clinit-triggered] BEFORE " + clazz.getName()
+                                + " loader=" + System.identityHashCode(clazz.getClassLoader()));
                         Object result;
                         try {
                             // clinit 执行：微信自己初始化该类（小游戏打开、CsoLoader 已就绪）
@@ -268,6 +271,7 @@ public class XposedEntry extends XposedModule {
                             throw t; // 继续抛出，不影响微信自身初始化流程
                         }
                         // clinit 成功：类已初始化、ArtMethod 就绪——移除去重标记并重新 hook
+                        log(Log.INFO, TAG, "[clinit-triggered] AFTER " + clazz.getName() + " (clinit done)");
                         ClassLoader loader = clazz.getClassLoader();
                         String key = "mtd:" + clazz.getName() + "@"
                                 + (loader != null ? System.identityHashCode(loader) : 0);
