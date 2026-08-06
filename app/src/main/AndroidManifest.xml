@@ -3,8 +3,8 @@
 
     <!-- LibXposed 模块：名字/描述直接写在 application 标签上（新 API 不使用 meta-data） -->
     <application
-        android:label="WeChatGM"
-        android:description="微信小游戏 GM 面板注入（LibXposed API 102，探测+注入）"
+        android:label="@string/app_name"
+        android:description="@string/app_description"
         android:hasCode="true" />
 
 </manifest>
