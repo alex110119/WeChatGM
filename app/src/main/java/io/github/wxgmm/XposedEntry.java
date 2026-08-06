@@ -196,7 +196,17 @@ public class XposedEntry extends XposedModule {
 
     private void tryHookClassMethods(Class<?> clazz) {
         if (clazz == null || !HOOKED_CLASSES.add("mtd:" + clazz.getName())) return;
-        // dump 所有方法签名，方便定位真实混淆名
+        // 诊断：打印 classloader 身份（排查 hook 挂在错误 classloader 副本上的问题）
+        try {
+            ClassLoader cl = clazz.getClassLoader();
+            log(Log.INFO, TAG, "[diag] class " + clazz.getName()
+                    + " loader=" + System.identityHashCode(cl) + " " + cl);
+            log(Log.INFO, TAG, "[diag] default loader=" + System.identityHashCode(sAppClassLoader)
+                    + " " + sAppClassLoader);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "[diag] classloader info failed: " + t);
+        }
+        // dump 所有方法签名，方便定位真实混淆名（含 isNative 标志）
         for (Method m : clazz.getDeclaredMethods()) {
             try {
                 StringBuilder sb = new StringBuilder();
@@ -207,7 +217,10 @@ public class XposedEntry extends XposedModule {
                     sb.append(pts[i].getSimpleName());
                 }
                 sb.append(')');
-                log(Log.INFO, TAG, "[dump] " + clazz.getName() + "." + sb);
+                boolean isNative = java.lang.reflect.Modifier.isNative(m.getModifiers());
+                boolean isStatic = java.lang.reflect.Modifier.isStatic(m.getModifiers());
+                log(Log.INFO, TAG, "[dump] " + clazz.getName() + "." + sb
+                        + (isNative ? " [native]" : "") + (isStatic ? " [static]" : ""));
             } catch (Throwable ignored) {
             }
         }
