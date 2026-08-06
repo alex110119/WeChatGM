@@ -171,6 +171,8 @@ public class XposedEntry extends XposedModule {
                             Class<?> clazz = Class.forName(name, false, cl);
                             if (clazz != null) {
                                 tryHookClassMethods(clazz);
+                                // 关键：hookClassInitializer——等微信自己初始化该类后再 hook
+                                hookClassInitializerFor(clazz);
                                 // 与 tryHookClass 一致：false 加载的类必须登记待激活 + 挂 CsoLoader 钩子 + 轮询兜底
                                 PENDING_ACTIVATE.add(name);
                                 hookCsoLoader(cl);
@@ -246,6 +248,9 @@ public class XposedEntry extends XposedModule {
             Class<?> clazz = Class.forName(className, false, cl);
             log(Log.INFO, TAG, "[candidate] found: " + className);
             tryHookClassMethods(clazz);
+            // 关键：hookClassInitializer——等微信自己初始化这个类（clinit 完成、
+            // CsoLoader 已就绪、ArtMethod 真正就绪）后再 hook 方法，绕过时机问题
+            hookClassInitializerFor(clazz);
             PENDING_ACTIVATE.add(className);
             // 事件驱动：hook CsoLoader.initialize 的 after，CsoLoader 就绪即激活
             hookCsoLoader(cl);
@@ -253,6 +258,29 @@ public class XposedEntry extends XposedModule {
             scheduleActivateRetry(className, cl);
         } catch (Throwable t) {
             log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + t.getMessage());
+        }
+    }
+
+    /** hookClassInitializer：微信自己初始化该类（clinit 完成）后重新 hook 方法 */
+    private void hookClassInitializerFor(Class<?> clazz) {
+        try {
+            hookClassInitializer(clazz)
+                    .setPriority(XposedInterface.PRIORITY_DEFAULT)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        // clinit 执行完成，类已初始化、ArtMethod 就绪
+                        Object result = chain.proceed();
+                        // 移除去重标记并重新 hook，确保 hook 挂到真正就绪的方法上
+                        ClassLoader loader = clazz.getClassLoader();
+                        String key = "mtd:" + clazz.getName() + "@"
+                                + (loader != null ? System.identityHashCode(loader) : 0);
+                        HOOKED_CLASSES.remove(key);
+                        tryHookClassMethods(clazz);
+                        return result;
+                    });
+            log(Log.INFO, TAG, "[clinit-hook] " + clazz.getName());
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "[clinit-hook] fail " + clazz.getName() + ": " + t.getMessage());
         }
     }
 
