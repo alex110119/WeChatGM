@@ -77,10 +77,30 @@ public class XposedEntry extends XposedModule {
         scanAppBrandClasses(param);
         // 2) 探测：hook ClassLoader.loadClass 记录 appbrand/v8/js 相关类名
         hookClassLoaderProbe();
-        // 3) 尝试候选类
+        // 3) 尝试候选类（default classloader 阶段）
         for (String cn : CANDIDATE_CLASSES) {
-            tryHookClass(cn);
+            tryHookClass(cn, sAppClassLoader);
         }
+    }
+
+    @Override
+    public void onPackageReady(PackageReadyParam param) {
+        if (!TARGET_PACKAGE.equals(param.getPackageName())) {
+            return;
+        }
+        // onPackageLoaded 之后，AppComponentFactory 已实例化 app classloader，
+        // 此时 getClassLoader() 返回最终 classloader —— 这是推荐的 hook 时机。
+        // 之前用 default classloader 加载的类副本可能不是运行时实际使用的，
+        // 导致 hook 静默注册成功但不触发（API 101+ 的坑）。
+        ClassLoader finalCl = param.getClassLoader();
+        log(Log.INFO, TAG, "WeChat ready, re-hook with final classloader: "
+                + System.identityHashCode(finalCl));
+        sAppClassLoader = finalCl;
+        for (String cn : CANDIDATE_CLASSES) {
+            tryHookClass(cn, finalCl);
+        }
+        // 用最终 classloader 重新跑 DexFile 扫描（覆盖不同 classloader 的副本）
+        scanWithClassLoader(param, finalCl);
     }
 
     // ------------------------------------------------------------------
@@ -93,46 +113,64 @@ public class XposedEntry extends XposedModule {
                 log(Log.WARN, TAG, "[scan] no applicationInfo");
                 return;
             }
-            java.util.List<String> dexPaths = new java.util.ArrayList<>();
-            if (ai.sourceDir != null) dexPaths.add(ai.sourceDir);
-            if (ai.splitSourceDirs != null) {
-                for (String s : ai.splitSourceDirs) {
-                    if (s != null) dexPaths.add(s);
-                }
-            }
-            log(Log.INFO, TAG, "[scan] dex count=" + dexPaths.size());
-            Thread t = new Thread(() -> {
-                int matched = 0;
-                for (String dexPath : dexPaths) {
-                    try {
-                        dalvik.system.DexFile dex = new dalvik.system.DexFile(dexPath);
-                        java.util.Enumeration<String> entries = dex.entries();
-                        while (entries.hasMoreElements()) {
-                            String name = entries.nextElement();
-                            if (name == null) continue;
-                            String lower = name.toLowerCase();
-                            if (!(lower.contains("appbrand") || lower.contains("jsruntime")
-                                    || lower.contains("jsbridge") || lower.contains("jscore"))) continue;
-                            matched++;
-                            log(Log.INFO, TAG, "[scan] class: " + name);
-                            if (matched > 300) break;
-                            try {
-                                Class<?> clazz = Class.forName(name, false, sAppClassLoader);
-                                if (clazz != null) tryHookClassMethods(clazz);
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                        dex.close();
-                    } catch (Throwable ignored) {
-                    }
-                }
-                log(Log.INFO, TAG, "[scan] done, matched=" + matched);
-            }, "wxgm-scan");
-            t.setDaemon(true);
-            t.start();
+            scanDex(ai.sourceDir, ai.splitSourceDirs, sAppClassLoader, "scan");
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "[scan] init failed: " + t);
         }
+    }
+
+    // onPackageReady：用最终 classloader 再扫一遍（PackageReadyParam 也暴露 ApplicationInfo）
+    private void scanWithClassLoader(PackageReadyParam param, ClassLoader cl) {
+        try {
+            android.content.pm.ApplicationInfo ai = param.getApplicationInfo();
+            if (ai == null) {
+                log(Log.WARN, TAG, "[scan2] no applicationInfo");
+                return;
+            }
+            scanDex(ai.sourceDir, ai.splitSourceDirs, cl, "scan2");
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "[scan2] init failed: " + t);
+        }
+    }
+
+    private void scanDex(String sourceDir, String[] splitDirs, ClassLoader cl, String tag) {
+        java.util.List<String> dexPaths = new java.util.ArrayList<>();
+        if (sourceDir != null) dexPaths.add(sourceDir);
+        if (splitDirs != null) {
+            for (String s : splitDirs) {
+                if (s != null) dexPaths.add(s);
+            }
+        }
+        log(Log.INFO, TAG, "[" + tag + "] dex count=" + dexPaths.size());
+        Thread t = new Thread(() -> {
+            int matched = 0;
+            for (String dexPath : dexPaths) {
+                try {
+                    dalvik.system.DexFile dex = new dalvik.system.DexFile(dexPath);
+                    java.util.Enumeration<String> entries = dex.entries();
+                    while (entries.hasMoreElements()) {
+                        String name = entries.nextElement();
+                        if (name == null) continue;
+                        String lower = name.toLowerCase();
+                        if (!(lower.contains("appbrand") || lower.contains("jsruntime")
+                                || lower.contains("jsbridge") || lower.contains("jscore"))) continue;
+                        matched++;
+                        log(Log.INFO, TAG, "[" + tag + "] class: " + name);
+                        if (matched > 300) break;
+                        try {
+                            Class<?> clazz = Class.forName(name, false, cl);
+                            if (clazz != null) tryHookClassMethods(clazz);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    dex.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            log(Log.INFO, TAG, "[" + tag + "] done, matched=" + matched);
+        }, "wxgm-" + tag);
+        t.setDaemon(true);
+        t.start();
     }
 
     // ------------------------------------------------------------------
@@ -184,9 +222,9 @@ public class XposedEntry extends XposedModule {
     // ------------------------------------------------------------------
     // 尝试 hook 候选类
     // ------------------------------------------------------------------
-    private void tryHookClass(String className) {
+    private void tryHookClass(String className, ClassLoader cl) {
         try {
-            Class<?> clazz = Class.forName(className, false, sAppClassLoader);
+            Class<?> clazz = Class.forName(className, false, cl);
             log(Log.INFO, TAG, "[candidate] found: " + className);
             tryHookClassMethods(clazz);
         } catch (Throwable t) {
@@ -195,7 +233,13 @@ public class XposedEntry extends XposedModule {
     }
 
     private void tryHookClassMethods(Class<?> clazz) {
-        if (clazz == null || !HOOKED_CLASSES.add("mtd:" + clazz.getName())) return;
+        if (clazz == null) return;
+        // 去重 key 必须包含 classloader 身份：不同 classloader 的类副本是不同对象，
+        // 各自都要 hook，否则会漏掉运行时实际使用的副本
+        ClassLoader loader = clazz.getClassLoader();
+        String key = "mtd:" + clazz.getName() + "@"
+                + (loader != null ? System.identityHashCode(loader) : 0);
+        if (!HOOKED_CLASSES.add(key)) return;
         // 诊断：打印 classloader 身份（排查 hook 挂在错误 classloader 副本上的问题）
         try {
             ClassLoader cl = clazz.getClassLoader();
