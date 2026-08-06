@@ -30,10 +30,14 @@ public class XposedEntry extends XposedModule {
 
     /** 候选 JS 引擎类（版本相关，找不到会跳过并记录日志） */
     private static final String[] CANDIDATE_CLASSES = {
-            // 真机日志确认：微信 8.0.76 实际 JS 求值入口（commonjni）
+            // ★ tinker 补丁 dex 确认：微信小游戏真实 JS 引擎 = J2V8 魔改（mmv8）
+            //   （在 tinker 补丁 classloader 里，base.apk 加载不到，靠 loadClass 拦截捕获）
+            "com.eclipsesource.mmv8.V8",
+            "com.eclipsesource.mmv8.MultiContextV8",
+            "com.eclipsesource.mmv8.V8Context",
+            "com.eclipsesource.mmv8.V8ContextWrapper",
+            // 旧候选（base.apk commonjni，留作对照；实际微信不走这些）
             "com.tencent.mm.appbrand.commonjni.AppBrandCommonBindingJni",
-            // AppBrandCommonBindingJni 静态初始化前置：CsoLoader（Missing initialization 提示）
-            // 日志确认真实类名：com.tencent.cso.CsoLoader（不在 commonjni 包！）
             "com.tencent.cso.CsoLoader",
             "com.tencent.mm.plugin.appbrand.jsruntime.AppBrandJsRuntime",
             "com.tencent.mm.plugin.appbrand.jsruntime.JsRuntime",
@@ -42,9 +46,12 @@ public class XposedEntry extends XposedModule {
             "com.tencent.mm.plugin.appbrand.jsapi.v8.V8Engine",
     };
 
-    /** 候选 evaluate 方法名 */
+    /** 候选 evaluate 方法名（含 J2V8/mmv8 的 execute*Script 系列） */
     private static final String[] EVALUATE_METHODS = {
-            "evaluateJavascript", "evaluate", "evaluateJs", "evaluateScript", "eval"
+            "evaluateJavascript", "evaluate", "evaluateJs", "evaluateScript", "eval",
+            "executeVoidScript", "executeStringScript", "executeScript",
+            "executeIntegerScript", "executeBooleanScript", "executeDoubleScript",
+            "executeArrayScript", "executeObjectScript"
     };
 
     /** 引擎就绪回调（native→Java 必走，用于捕获引擎实例作为注入时机） */
@@ -209,10 +216,17 @@ public class XposedEntry extends XposedModule {
                         Object result = chain.proceed();
                         try {
                             String name = String.valueOf(chain.getArg(0));
+                            // ★ mmv8 真实引擎类：记录实际加载它的 classloader（tinker 补丁 loader）
                             if (isJsRuntimeClass(name) && HOOKED_CLASSES.add("cls:" + name)) {
-                                log(Log.INFO, TAG, "[probe] loaded class: " + name);
+                                Object loaderObj = chain.getThisObject();
+                                log(Log.INFO, TAG, "[probe] loaded class: " + name
+                                        + " loader=" + (loaderObj != null
+                                        ? System.identityHashCode(loaderObj) : 0) + " " + loaderObj);
                                 if (result instanceof Class) {
-                                    tryHookClassMethods((Class<?>) result);
+                                    Class<?> loaded = (Class<?>) result;
+                                    tryHookClassMethods(loaded);
+                                    // 关键：注册 clinit 钩子，等微信初始化该类后再重新 hook
+                                    hookClassInitializerFor(loaded);
                                 }
                             }
                         } catch (Throwable ignored) {
@@ -227,6 +241,8 @@ public class XposedEntry extends XposedModule {
     private boolean isJsRuntimeClass(String name) {
         if (name == null || name.isEmpty()) return false;
         String lower = name.toLowerCase();
+        // ★ mmv8（J2V8 魔改）：微信小游戏真实 JS 引擎，tinker 补丁 classloader 加载
+        if (lower.contains("eclipsesource") || lower.contains("mmv8")) return true;
         return (lower.contains("appbrand") || lower.contains("jsruntime") || lower.contains("jsbridge"))
                 && (lower.contains("v8") || lower.contains("jscore") || lower.contains("javascript")
                 || lower.contains("evaluate") || lower.contains("runtime") || lower.contains("js"));
