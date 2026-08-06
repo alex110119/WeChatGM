@@ -158,8 +158,10 @@ public class XposedEntry extends XposedModule {
                         log(Log.INFO, TAG, "[" + tag + "] class: " + name);
                         if (matched > 300) break;
                         try {
-                            // initialize=false：避免触发微信 JNI 类的静态初始化（CsoLoader 前置依赖）
-                            Class<?> clazz = Class.forName(name, false, cl);
+                            // initialize=true：hook 需要类已静态初始化（false 是伪成功）。
+                            // AppBrandCommonBindingJni 这类 JNI 绑定类若 CsoLoader 未就绪会抛异常，
+                            // 由 tryHookClass 的 scheduleCsoRetry 延迟重试兜底。
+                            Class<?> clazz = Class.forName(name, true, cl);
                             if (clazz != null) tryHookClassMethods(clazz);
                         } catch (Throwable ignored) {
                         }
@@ -225,15 +227,44 @@ public class XposedEntry extends XposedModule {
     // ------------------------------------------------------------------
     private void tryHookClass(String className, ClassLoader cl) {
         try {
-            // 注意：必须 initialize=false！AppBrandCommonBindingJni 是微信 JNI 绑定类，
-            // 静态初始化依赖 CsoLoader 前置（Missing initialization before executing），
-            // initialize=true 会导致类加载失败、hook 全部落空。
-            Class<?> clazz = Class.forName(className, false, cl);
+            // initialize=true：执行静态初始化，ArtMethod 才真正就绪。
+            // initialize=false 是伪成功（hook 注册了但从不触发）。
+            Class<?> clazz = Class.forName(className, true, cl);
             log(Log.INFO, TAG, "[candidate] found: " + className);
             tryHookClassMethods(clazz);
         } catch (Throwable t) {
-            log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + t.getMessage());
+            String msg = String.valueOf(t.getMessage());
+            log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + msg);
+            // CsoLoader 前置未就绪（AppBrandCommonBindingJni 是微信 JNI 绑定类，
+            // 静态初始化需要 CsoLoader.initialize 先执行）：延迟重试，微信随后会初始化它
+            if (msg.contains("CsoLoader") || msg.contains("Missing initialization")) {
+                scheduleCsoRetry(className, cl);
+            }
         }
+    }
+
+    /** CsoLoader 就绪后延迟重试（最多 60 秒），成功后 hook 到真正初始化的类 */
+    private void scheduleCsoRetry(String className, ClassLoader cl) {
+        Thread t = new Thread(() -> {
+            try {
+                for (int i = 0; i < 30; i++) {
+                    Thread.sleep(2000);
+                    try {
+                        Class<?> clazz = Class.forName(className, true, cl);
+                        log(Log.INFO, TAG, "[cso-retry] init success after "
+                                + ((i + 1) * 2) + "s: " + className);
+                        tryHookClassMethods(clazz);
+                        return;
+                    } catch (Throwable ignored) {
+                        // CsoLoader 还未就绪，继续等
+                    }
+                }
+                log(Log.WARN, TAG, "[cso-retry] give up: " + className);
+            } catch (Throwable ignored) {
+            }
+        }, "wxgm-csoretry");
+        t.setDaemon(true);
+        t.start();
     }
 
     private void tryHookClassMethods(Class<?> clazz) {
