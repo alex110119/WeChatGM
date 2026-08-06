@@ -5,7 +5,9 @@ import android.util.Log;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -93,6 +95,26 @@ public class XposedEntry extends XposedModule {
         for (String cn : CANDIDATE_CLASSES) {
             tryHookClass(cn, sAppClassLoader);
         }
+        // ★ 不依赖 onPackageReady（225155 日志证明其从未触发，STEP-3=0）：
+        //   延时重试，模拟 onPackageReady 时机（类加载/初始化完成后再 hook 一轮）
+        scheduleDelayedRehook();
+    }
+
+    /** 延时重试：等微信完成类加载/初始化后再 tryHookClass 一轮（替代 onPackageReady） */
+    private void scheduleDelayedRehook() {
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(3000); // 等微信初始化
+                log(Log.INFO, TAG, "[rehook] delayed re-hook with loader="
+                        + System.identityHashCode(sAppClassLoader));
+                for (String cn : CANDIDATE_CLASSES) {
+                    tryHookClass(cn, sAppClassLoader);
+                }
+            } catch (Throwable ignored) {
+            }
+        }, "wxgm-rehook");
+        t.setDaemon(true);
+        t.start();
     }
 
     @Override
@@ -259,10 +281,22 @@ public class XposedEntry extends XposedModule {
             Class<?> clazz = Class.forName(className, false, cl);
             log(Log.INFO, TAG, "[STEP-5] tryHookClass found: " + className
                     + " loader=" + System.identityHashCode(cl));
-            tryHookClassMethods(clazz);      // 预注册 hook（若类已初始化则直接生效）
-            hookClassInitializerFor(clazz);  // 关键：等微信自己初始化该类后再重新 hook
+            try {
+                tryHookClassMethods(clazz);      // 预注册 hook（若类已初始化则直接生效）
+            } finally {
+                // ★ try-finally 确认执行流：即使内部抛异常也能看到这一步跑完了
+                log(Log.INFO, TAG, "[tryHookClass] tryHookClassMethods done for " + className);
+            }
+            try {
+                hookClassInitializerFor(clazz);  // 关键：等微信自己初始化该类后再重新 hook
+            } finally {
+                log(Log.INFO, TAG, "[tryHookClass] hookClassInitializerFor done for " + className);
+            }
         } catch (Throwable t) {
-            log(Log.DEBUG, TAG, "[STEP-5] tryHookClass skip " + className + ": " + t.getMessage());
+            // ★ ERROR + 完整堆栈：DEBUG 会被 LSPosed 过滤、getMessage() 可能为 null
+            log(Log.ERROR, TAG, "[STEP-5] tryHookClass skip " + className + " -> "
+                    + t.getClass().getName() + ": " + t.getMessage());
+            log(Log.ERROR, TAG, Log.getStackTraceString(t));
         }
     }
 
@@ -340,18 +374,33 @@ public class XposedEntry extends XposedModule {
                 boolean isStatic = java.lang.reflect.Modifier.isStatic(m.getModifiers());
                 log(Log.INFO, TAG, "[dump] " + clazz.getName() + "." + sb
                         + (isNative ? " [native]" : "") + (isStatic ? " [static]" : ""));
-            } catch (Throwable ignored) {
+            } catch (Throwable td) {
+                // ★ 判断 B：dump 循环里反射访问抛异常会静默中断整个方法——
+                //   打印完整异常，不忽略
+                log(Log.ERROR, TAG, "[dump-loop] exception at " + clazz.getName() + "."
+                        + m.getName() + ": " + td.getClass().getName() + " msg=" + td.getMessage());
             }
         }
+        int checked = 0;
         for (Method m : clazz.getDeclaredMethods()) {
+            checked++;
             String mn = m.getName();
-            Class<?>[] pts = m.getParameterTypes();
             boolean isReady = matchesReadyName(mn);
             boolean isEval = matchesEvaluateName(mn);
+            // ★ 判断 A：无条件打印每个方法名+参数（ERROR 级别防过滤）——
+            //   确认 hook 循环真的遍历到了，executeVoidScript 是否进入循环
+            try {
+                log(Log.ERROR, TAG, "[hook-loop-check] " + clazz.getName() + "." + mn
+                        + " params=" + java.util.Arrays.toString(m.getParameterTypes()));
+            } catch (Throwable ignored) {
+            }
             // ★ 过滤条件：只按方法名过滤，不再用 pts[0] != String 硬性要求——
             //   mmv8/J2V8 的 execute*Script 第一个参数可能是 runtime/context 句柄(long)，
             //   脚本字符串在第二位，若按参数类型过滤会把真正的方法全 continue 掉（STEP-8=0 的根因）
-            if (!isReady && !isEval) continue;
+            if (!isReady && !isEval) {
+                log(Log.DEBUG, TAG, "[hook-skip-filter] " + clazz.getName() + "." + mn);
+                continue;
+            }
             try {
                 // 官方 example 写法：hook(method).intercept(chain -> ...)，不额外设置 exceptionMode
                 hook(m)
@@ -371,6 +420,33 @@ public class XposedEntry extends XposedModule {
                 log(Log.ERROR, TAG, "[hook] fail " + clazz.getName() + "." + mn + " -> "
                         + t.getClass().getName() + ": " + t.getMessage());
                 log(Log.ERROR, TAG, Log.getStackTraceString(t));
+            }
+        }
+        // ★ 判断 B：确认 hook 循环确实执行完毕（若这里不打，说明循环被异常打断）
+        log(Log.INFO, TAG, "[method-check] done hook loop for " + clazz.getName()
+                + " total methods checked=" + checked);
+        // ★ 构造函数 hook 兜底：clinit 可能已执行完（API 102 javadoc：class 已初始化则 clinit hook 永不触发），
+        //   改走构造函数——实例创建即捕获引擎，不依赖 <clinit>
+        for (Constructor<?> c : clazz.getDeclaredConstructors()) {
+            try {
+                hook(c).intercept(chain -> {
+                    Object result = chain.proceed();
+                    Object instance = chain.getThisObject();
+                    if (instance != null && !INJECTED.get()) {
+                        log(Log.INFO, TAG, "[ctor-capture] instance created: " + clazz.getName());
+                        Method eval = findEvaluateMethod(clazz);
+                        if (eval != null) {
+                            sEngineInstance = instance;
+                            sEvaluateMethod = eval;
+                            scheduleInject();
+                        }
+                    }
+                    return result;
+                });
+                log(Log.INFO, TAG, "[ctor-hook] " + clazz.getName() + "." + c.getName());
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "[ctor-hook] fail " + clazz.getName() + " -> "
+                        + t.getClass().getName() + ": " + t.getMessage());
             }
         }
     }
