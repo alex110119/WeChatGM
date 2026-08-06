@@ -164,10 +164,11 @@ public class XposedEntry extends XposedModule {
                         log(Log.INFO, TAG, "[" + tag + "] class: " + name);
                         if (matched > 300) break;
                         try {
-                            // initialize=true：hook 需要类已静态初始化（false 是伪成功）。
-                            // AppBrandCommonBindingJni 这类 JNI 绑定类若 CsoLoader 未就绪会抛异常，
-                            // 由 tryHookClass 的 scheduleCsoRetry 延迟重试兜底。
-                            Class<?> clazz = Class.forName(name, true, cl);
+                            // initialize=false：只加载不初始化，避免提前触发 AppBrandCommonBindingJni
+                            // 的 clinit（CsoLoader 未就绪会抛 Missing initialization，导致类进入
+                            // 初始化失败状态，后续 tryHookClass 的 false 加载也会失败）。
+                            // 真正的激活由 hookCsoLoader → activatePending 显式触发。
+                            Class<?> clazz = Class.forName(name, false, cl);
                             if (clazz != null) tryHookClassMethods(clazz);
                         } catch (Throwable ignored) {
                         }
