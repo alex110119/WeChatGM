@@ -44,6 +44,13 @@ public class XposedEntry extends XposedModule {
             "evaluateJavascript", "evaluate", "evaluateJs", "evaluateScript", "eval"
     };
 
+    /** 引擎就绪回调（native→Java 必走，用于捕获引擎实例作为注入时机） */
+    private static final String[] READY_METHODS = {
+            "onJSRuntimeReady", "notifyRuntimeReady", "nativeRuntimeReady",
+            "notifyPostRuntimeReady", "notifyCreate", "onWorkerCreated",
+            "notifyContextCreated", "notifyBindTo"
+    };
+
     /** 注入一次即可 */
     private static final AtomicBoolean INJECTED = new AtomicBoolean(false);
     /** 记录已 hook 的类，避免重复 */
@@ -207,23 +214,33 @@ public class XposedEntry extends XposedModule {
         for (Method m : clazz.getDeclaredMethods()) {
             String mn = m.getName();
             Class<?>[] pts = m.getParameterTypes();
-            // 宽松匹配：方法名像 evaluate，或第一个参数是 String（混淆后 evaluate 类方法通常第一个参数是 JS 代码字符串）
-            if (pts.length == 0 || pts[0] != String.class) continue;
-            if (!matchesEvaluateName(mn) && pts.length > 2) continue;
+            boolean isReady = matchesReadyName(mn);
+            // 宽松匹配：方法名像 evaluate，或第一个参数是 String（混淆后 evaluate 类方法通常第一个参数是 JS 代码字符串），或引擎就绪回调
+            if (pts.length == 0 || (pts[0] != String.class && !isReady)) continue;
+            if (!isReady && !matchesEvaluateName(mn) && pts.length > 2) continue;
             try {
                 hook(m)
                         .setPriority(XposedInterface.PRIORITY_DEFAULT)
                         .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .intercept(chain -> {
                             Object result = chain.proceed();
-                            captureEngineAndInject(chain, m);
+                            captureEngineAndInject(chain, m, isReady);
                             return result;
                         });
-                log(Log.INFO, TAG, "[hook] " + clazz.getName() + "." + mn);
+                log(Log.INFO, TAG, "[hook] " + clazz.getName() + "." + mn + (isReady ? " (ready)" : ""));
             } catch (Throwable t) {
                 log(Log.DEBUG, TAG, "[hook] fail " + clazz.getName() + "." + mn + ": " + t.getMessage());
             }
         }
+    }
+
+    private boolean matchesReadyName(String name) {
+        if (name == null) return false;
+        String lower = name.toLowerCase();
+        for (String r : READY_METHODS) {
+            if (lower.equals(r.toLowerCase())) return true;
+        }
+        return false;
     }
 
     private boolean matchesEvaluateName(String name) {
@@ -236,17 +253,53 @@ public class XposedEntry extends XposedModule {
     // ------------------------------------------------------------------
     // 捕获引擎实例，延迟注入 payload
     // ------------------------------------------------------------------
-    private void captureEngineAndInject(XposedInterface.Chain chain, Method method) {
+    private void captureEngineAndInject(XposedInterface.Chain chain, Method method, boolean isReady) {
         try {
             if (INJECTED.get()) return;
-            sEngineInstance = chain.getThisObject();
-            sEvaluateMethod = method;
-            log(Log.INFO, TAG, "engine captured: " + method.getDeclaringClass().getName()
-                    + "." + method.getName());
-            scheduleInject();
+            Object thiz = chain.getThisObject();
+            if (thiz == null) return; // 静态方法拿不到实例，跳过（evaluate 通常有实例）
+            if (isReady) {
+                // 就绪回调：this 就是引擎实例（AppBrandCommonBindingJni），且引擎已创建
+                // 从同类中找 evaluateScript 作为注入通道
+                Method eval = findEvaluateMethod(thiz.getClass());
+                if (eval == null) {
+                    log(Log.WARN, TAG, "ready callback but no evaluate method in "
+                            + thiz.getClass().getName());
+                    return;
+                }
+                sEngineInstance = thiz;
+                sEvaluateMethod = eval;
+                log(Log.INFO, TAG, "engine captured via ready callback: " + method.getName()
+                        + " -> " + eval.getName());
+                scheduleInject();
+            } else {
+                // evaluate 方法本身：this 是引擎实例，method 即注入通道
+                sEngineInstance = thiz;
+                sEvaluateMethod = method;
+                log(Log.INFO, TAG, "engine captured: " + method.getDeclaringClass().getName()
+                        + "." + method.getName());
+                scheduleInject();
+            }
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "captureEngine failed: " + t);
         }
+    }
+
+    private Method findEvaluateMethod(Class<?> clazz) {
+        for (String e : EVALUATE_METHODS) {
+            try {
+                for (Method m : clazz.getDeclaredMethods()) {
+                    if (m.getName().equalsIgnoreCase(e) || m.getName().toLowerCase().contains(e.toLowerCase())) {
+                        Class<?>[] pts = m.getParameterTypes();
+                        if (pts.length >= 1 && pts[0] == String.class) {
+                            return m;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 
     private void scheduleInject() {
