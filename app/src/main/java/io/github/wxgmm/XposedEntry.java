@@ -300,13 +300,20 @@ public class XposedEntry extends XposedModule {
 
     /** 显式激活：对待激活类执行 Class.forName(initialize=true) 触发 clinit */
     private void activatePending(ClassLoader cl) {
+        if (PENDING_ACTIVATE.isEmpty()) {
+            log(Log.WARN, TAG, "[activate] PENDING_ACTIVATE is EMPTY (nothing to activate)");
+            return;
+        }
         for (String cn : new HashSet<>(PENDING_ACTIVATE)) {
             try {
                 Class<?> clazz = Class.forName(cn, true, cl); // 触发 clinit
                 PENDING_ACTIVATE.remove(cn);
                 log(Log.INFO, TAG, "[activate] clinit done: " + cn);
             } catch (Throwable t) {
-                log(Log.WARN, TAG, "[activate] fail " + cn + ": " + t.getMessage());
+                // 打印完整异常（含根因），不忽略
+                log(Log.WARN, TAG, "[activate] fail " + cn + ": " + t
+                        + " | cause=" + (t.getCause() != null ? t.getCause() : "null")
+                        + " | msg=" + t.getMessage());
             }
         }
     }
@@ -315,6 +322,7 @@ public class XposedEntry extends XposedModule {
     private void scheduleActivateRetry(String className, ClassLoader cl) {
         Thread t = new Thread(() -> {
             try {
+                String lastErr = "";
                 for (int i = 0; i < 30; i++) {
                     Thread.sleep(2000);
                     try {
@@ -323,11 +331,19 @@ public class XposedEntry extends XposedModule {
                         log(Log.INFO, TAG, "[activate-retry] clinit done after "
                                 + ((i + 1) * 2) + "s: " + className);
                         return;
-                    } catch (Throwable ignored) {
-                        // CsoLoader 还未就绪，继续等
+                    } catch (Throwable t2) {
+                        // 记录最后一次失败原因，give up 时打印（不 ignored）
+                        lastErr = t2 + " | cause="
+                                + (t2.getCause() != null ? t2.getCause() : "null")
+                                + " | msg=" + t2.getMessage();
+                        // 每 5 次打印一次进展，避免刷屏
+                        if (i % 5 == 0) {
+                            log(Log.WARN, TAG, "[activate-retry] " + className
+                                    + " attempt " + (i + 1) + " fail: " + lastErr);
+                        }
                     }
                 }
-                log(Log.WARN, TAG, "[activate-retry] give up: " + className);
+                log(Log.WARN, TAG, "[activate-retry] give up: " + className + " | lastErr=" + lastErr);
             } catch (Throwable ignored) {
             }
         }, "wxgm-activate");
