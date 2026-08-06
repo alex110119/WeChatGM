@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- LibXposed 模块：名字/描述直接写在 application 标签上（新 API 不使用 meta-data） -->
+    <application
+        android:label="WeChatGM"
+        android:description="微信小游戏 GM 面板注入（LibXposed API 102，探测+注入）"
+        android:hasCode="true" />
+
+</manifest>
