@@ -164,19 +164,13 @@ public class XposedEntry extends XposedModule {
                         log(Log.INFO, TAG, "[" + tag + "] class: " + name);
                         if (matched > 300) break;
                         try {
-                            // initialize=false：只加载不初始化，避免提前触发 AppBrandCommonBindingJni
-                            // 的 clinit（CsoLoader 未就绪会抛 Missing initialization，导致类进入
-                            // 初始化失败状态，后续 tryHookClass 的 false 加载也会失败）。
-                            // 真正的激活由 hookCsoLoader → activatePending 显式触发。
+                            // initialize=false：只加载不初始化，绝不主动触发 clinit
+                            // （避免把类标记为 NoClassDefFoundError，破坏微信后续初始化）。
                             Class<?> clazz = Class.forName(name, false, cl);
                             if (clazz != null) {
                                 tryHookClassMethods(clazz);
                                 // 关键：hookClassInitializer——等微信自己初始化该类后再 hook
                                 hookClassInitializerFor(clazz);
-                                // 与 tryHookClass 一致：false 加载的类必须登记待激活 + 挂 CsoLoader 钩子 + 轮询兜底
-                                PENDING_ACTIVATE.add(name);
-                                hookCsoLoader(cl);
-                                scheduleActivateRetry(name, cl);
                             }
                         } catch (Throwable ignored) {
                         }
@@ -242,20 +236,13 @@ public class XposedEntry extends XposedModule {
     // ------------------------------------------------------------------
     private void tryHookClass(String className, ClassLoader cl) {
         try {
-            // initialize=false：只加载不初始化（clinit 不执行）。
-            // hook 会注册，但 ArtMethod 未初始化，拦截器不触发（伪成功）。
-            // 必须显式激活：见 hookCsoLoader + activatePending。
+            // initialize=false：只加载不初始化，绝不主动触发 clinit——
+            // CsoLoader 未就绪时主动触发会把类永久标记为 NoClassDefFoundError，
+            // 导致微信自己初始化也失败。激活完全交给 hookClassInitializer。
             Class<?> clazz = Class.forName(className, false, cl);
             log(Log.INFO, TAG, "[candidate] found: " + className);
-            tryHookClassMethods(clazz);
-            // 关键：hookClassInitializer——等微信自己初始化这个类（clinit 完成、
-            // CsoLoader 已就绪、ArtMethod 真正就绪）后再 hook 方法，绕过时机问题
-            hookClassInitializerFor(clazz);
-            PENDING_ACTIVATE.add(className);
-            // 事件驱动：hook CsoLoader.initialize 的 after，CsoLoader 就绪即激活
-            hookCsoLoader(cl);
-            // 轮询兜底：CsoLoader 最终会被微信初始化，轮询触发 clinit
-            scheduleActivateRetry(className, cl);
+            tryHookClassMethods(clazz);      // 预注册 hook（若类已初始化则直接生效）
+            hookClassInitializerFor(clazz);  // 关键：等微信自己初始化该类后再重新 hook
         } catch (Throwable t) {
             log(Log.DEBUG, TAG, "[candidate] skip " + className + ": " + t.getMessage());
         }
@@ -268,9 +255,19 @@ public class XposedEntry extends XposedModule {
                     .setPriority(XposedInterface.PRIORITY_DEFAULT)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept(chain -> {
-                        // clinit 执行完成，类已初始化、ArtMethod 就绪
-                        Object result = chain.proceed();
-                        // 移除去重标记并重新 hook，确保 hook 挂到真正就绪的方法上
+                        Object result;
+                        try {
+                            // clinit 执行：微信自己初始化该类（小游戏打开、CsoLoader 已就绪）
+                            result = chain.proceed();
+                        } catch (Throwable t) {
+                            // 报错日志保留：clinit 失败时打印完整异常（含 cause/msg）
+                            log(Log.WARN, TAG, "[clinit-hook] " + clazz.getName()
+                                    + " clinit FAILED: " + t
+                                    + " | cause=" + (t.getCause() != null ? t.getCause() : "null")
+                                    + " | msg=" + t.getMessage());
+                            throw t; // 继续抛出，不影响微信自身初始化流程
+                        }
+                        // clinit 成功：类已初始化、ArtMethod 就绪——移除去重标记并重新 hook
                         ClassLoader loader = clazz.getClassLoader();
                         String key = "mtd:" + clazz.getName() + "@"
                                 + (loader != null ? System.identityHashCode(loader) : 0);
@@ -282,101 +279,6 @@ public class XposedEntry extends XposedModule {
         } catch (Throwable t) {
             log(Log.DEBUG, TAG, "[clinit-hook] fail " + clazz.getName() + ": " + t.getMessage());
         }
-    }
-
-    /** 待激活类（false 加载但 clinit 未执行），CsoLoader 就绪后显式激活 */
-    private static final Set<String> PENDING_ACTIVATE = new HashSet<>();
-    private static volatile boolean CSO_HOOKED = false;
-
-    /** hook CsoLoader 的方法（after 回调）：CsoLoader 初始化时激活待激活类 */
-    private void hookCsoLoader(ClassLoader cl) {
-        if (CSO_HOOKED) return;
-        String[] csoCandidates = {
-                // 日志确认真实类名（不在 commonjni 包）
-                "com.tencent.cso.CsoLoader",
-        };
-        for (String cn : csoCandidates) {
-            try {
-                Class<?> cso = Class.forName(cn, false, cl);
-                int hooked = 0;
-                for (Method m : cso.getDeclaredMethods()) {
-                    // native 方法 Java 层 hook 不到，跳过；
-                    // 注意：不限制 static——d(...) 是 nativeInitialize 的 Java 封装（实例方法），
-                    // 是 AppBrandCommonBindingJni clinit 要求的 "CsoLoader.initialize" 本体
-                    if (java.lang.reflect.Modifier.isNative(m.getModifiers())) continue;
-                    try {
-                        hook(m).intercept(chain -> {
-                            Object result = chain.proceed();
-                            activatePending(cl);
-                            return result;
-                        });
-                        hooked++;
-                        log(Log.INFO, TAG, "[cso] hooked: " + cn + "." + m.getName());
-                    } catch (Throwable ignored) {
-                    }
-                }
-                if (hooked > 0) {
-                    CSO_HOOKED = true;
-                    log(Log.INFO, TAG, "[cso] CsoLoader hooked, methods=" + hooked);
-                    return;
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        log(Log.WARN, TAG, "[cso] CsoLoader not found, relying on poll retry");
-    }
-
-    /** 显式激活：对待激活类执行 Class.forName(initialize=true) 触发 clinit */
-    private void activatePending(ClassLoader cl) {
-        if (PENDING_ACTIVATE.isEmpty()) {
-            log(Log.WARN, TAG, "[activate] PENDING_ACTIVATE is EMPTY (nothing to activate)");
-            return;
-        }
-        for (String cn : new HashSet<>(PENDING_ACTIVATE)) {
-            try {
-                Class<?> clazz = Class.forName(cn, true, cl); // 触发 clinit
-                PENDING_ACTIVATE.remove(cn);
-                log(Log.INFO, TAG, "[activate] clinit done: " + cn);
-            } catch (Throwable t) {
-                // 打印完整异常（含根因），不忽略
-                log(Log.WARN, TAG, "[activate] fail " + cn + ": " + t
-                        + " | cause=" + (t.getCause() != null ? t.getCause() : "null")
-                        + " | msg=" + t.getMessage());
-            }
-        }
-    }
-
-    /** CsoLoader 就绪后轮询激活（最多 60 秒），兜底方案 */
-    private void scheduleActivateRetry(String className, ClassLoader cl) {
-        Thread t = new Thread(() -> {
-            try {
-                String lastErr = "";
-                for (int i = 0; i < 30; i++) {
-                    Thread.sleep(2000);
-                    try {
-                        Class<?> clazz = Class.forName(className, true, cl); // 触发 clinit
-                        PENDING_ACTIVATE.remove(className);
-                        log(Log.INFO, TAG, "[activate-retry] clinit done after "
-                                + ((i + 1) * 2) + "s: " + className);
-                        return;
-                    } catch (Throwable t2) {
-                        // 记录最后一次失败原因，give up 时打印（不 ignored）
-                        lastErr = t2 + " | cause="
-                                + (t2.getCause() != null ? t2.getCause() : "null")
-                                + " | msg=" + t2.getMessage();
-                        // 每 5 次打印一次进展，避免刷屏
-                        if (i % 5 == 0) {
-                            log(Log.WARN, TAG, "[activate-retry] " + className
-                                    + " attempt " + (i + 1) + " fail: " + lastErr);
-                        }
-                    }
-                }
-                log(Log.WARN, TAG, "[activate-retry] give up: " + className + " | lastErr=" + lastErr);
-            } catch (Throwable ignored) {
-            }
-        }, "wxgm-activate");
-        t.setDaemon(true);
-        t.start();
     }
 
     private void tryHookClassMethods(Class<?> clazz) {
@@ -432,10 +334,6 @@ public class XposedEntry extends XposedModule {
                                         + (isReady ? " (ready)" : ""));
                             }
                             Object result = chain.proceed();
-                            // CsoLoader 的任何方法被调用 → CsoLoader 初始化进行中 → 立即激活待激活类
-                            if (isCsoLoaderClass(clazz.getName())) {
-                                activatePending(clazz.getClassLoader());
-                            }
                             captureEngineAndInject(chain, m, isReady);
                             return result;
                         });
@@ -444,10 +342,6 @@ public class XposedEntry extends XposedModule {
                 log(Log.DEBUG, TAG, "[hook] fail " + clazz.getName() + "." + mn + ": " + t.getMessage());
             }
         }
-    }
-
-    private boolean isCsoLoaderClass(String name) {
-        return name != null && name.contains("CsoLoader");
     }
 
     private boolean matchesReadyName(String name) {
