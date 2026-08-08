@@ -14,13 +14,14 @@ import java.util.Set;
  *
  * 推翻 v1（hook mmv8.V8 的 execute*Script，已被证伪——8.0.76 小游戏 JS 不走那些入口）。
  *
- * 已坐实的调用链（本次会话逐一验证）：
+ * 已坐实的调用链（本次会话逐一验证 + MT 静态定位 base.apk）：
  *   - 游戏跑在 appbrand 子进程（LSPosed 自动注入，无需进程判断）
- *   - 微信高层 JS 执行入口 = com.tencent.mm.plugin.appbrand.jsruntime.c0
+ *   - 微信高层 JS 执行入口接口 = com.tencent.mm.plugin.appbrand.jsruntime.c0
  *     .evaluateJavascript(String js, ValueCallback cb) : void
+ *   - ★ c0 是 interface abstract（classHeader 实证），libxposed 禁止 hook 抽象方法
+ *     → 必须 hook 具体实现类。MT 静态定位实现 c0 的具体类：
+ *       cl.c3（public evaluateJavascript, 7 指令）/ cl.f3（public, 6 指令）
  *   - 参数 js 即要执行的 JS 源码 → hook 后替换/追加自己的 JS 即可执行
- *   - 52pojie 参考（旧版微信）：HookBox 注入点 JsValidationInjector（utils.c3.a），
- *     底层调用链同样落在这类 evaluateJavascript/executeScript 高层入口
  *
  * 注入目标（GM 开关）：macro.TEST = !0  （模块导出对象属性，PC 已验证 gui.open 触发）
  */
@@ -28,8 +29,14 @@ public class XposedEntry extends XposedModule {
 
     private static final String TAG = "WxGM";
 
-    /** 目标：微信高层 JS 执行入口（8.0.76 已坐实） */
-    private static final String HOOK_CLASS = "com.tencent.mm.plugin.appbrand.jsruntime.c0";
+    /**
+     * 目标：c0 接口的【具体实现类】（MT 静态定位，非抽象方法，可 hook）。
+     * cl.c3 / cl.f3 都是 public evaluateJavascript(String, ValueCallback)。
+     */
+    private static final String[] HOOK_CLASSES = {
+            "cl.c3",
+            "cl.f3",
+    };
     private static final String HOOK_METHOD = "evaluateJavascript";
 
     /**
@@ -57,8 +64,6 @@ public class XposedEntry extends XposedModule {
             return;
         }
         log(Log.INFO, TAG, "[v2] package loaded (first=" + param.isFirstPackage() + ")");
-        // onPackageLoaded 阶段 default classloader 可能不是最终副本；
-        // 用 onPackageReady 的最终 classloader hook（API 102 推荐时机）。
     }
 
     @Override
@@ -67,10 +72,12 @@ public class XposedEntry extends XposedModule {
             return;
         }
         ClassLoader cl = param.getClassLoader();
-        log(Log.INFO, TAG, "[v2] package ready, hooking " + HOOK_CLASS + "." + HOOK_METHOD
-                + " loader=" + System.identityHashCode(cl));
+        log(Log.INFO, TAG, "[v2] package ready, hooking " + String.join("/", HOOK_CLASSES)
+                + "." + HOOK_METHOD + " loader=" + System.identityHashCode(cl));
         try {
-            hookEvaluateJavascript(cl);
+            for (String cn : HOOK_CLASSES) {
+                hookConcreteClass(cn, cl);
+            }
             // 延时再 hook 一轮：appbrand 子进程的类可能是 tinker 补丁 classloader 加载的副本
             scheduleRehook(cl);
         } catch (Throwable t) {
@@ -79,38 +86,38 @@ public class XposedEntry extends XposedModule {
         }
     }
 
-    /** 核心 hook：找 evaluateJavascript 方法，hook(m).intercept(...) 改 args[0] 注入 JS */
-    private void hookEvaluateJavascript(ClassLoader cl) {
+    /** 对具体实现类 hook evaluateJavascript（具体方法，非抽象，可 hook） */
+    private void hookConcreteClass(String className, ClassLoader cl) {
         Class<?> clazz = null;
         try {
-            clazz = Class.forName(HOOK_CLASS, false, cl);
+            clazz = Class.forName(className, false, cl);
         } catch (Throwable t) {
-            // 当前 classloader 还加载不到（类未初始化/在别的 loader）
-            log(Log.WARN, TAG, "[v2] class not found yet: " + HOOK_CLASS + " -> " + t);
+            log(Log.WARN, TAG, "[v2] class not found yet: " + className + " -> " + t);
+            return;
+        }
+        String key = className + "@" + System.identityHashCode(cl) + "." + HOOK_METHOD;
+        if (!HOOKED_KEYS.add(key)) {
+            log(Log.INFO, TAG, "[v2] already hooked, skip: " + key);
             return;
         }
         Method target = null;
         for (Method m : clazz.getDeclaredMethods()) {
-            if (HOOK_METHOD.equals(m.getName())) {
+            if (HOOK_METHOD.equals(m.getName())
+                    && !java.lang.reflect.Modifier.isAbstract(m.getModifiers())) {
                 target = m;
                 break;
             }
         }
         if (target == null) {
-            log(Log.WARN, TAG, "[v2] method not found: " + HOOK_CLASS + "." + HOOK_METHOD);
-            return;
-        }
-        // 按 loader 身份去重（不同 classloader 的类副本是不同对象，各自 hook）
-        String key = HOOK_CLASS + "@" + System.identityHashCode(cl) + "." + HOOK_METHOD;
-        if (!HOOKED_KEYS.add(key)) {
-            log(Log.INFO, TAG, "[v2] already hooked, skip: " + key);
+            log(Log.WARN, TAG, "[v2] concrete method not found: " + className + "." + HOOK_METHOD
+                    + " (may still be abstract)");
+            HOOKED_KEYS.remove(key);
             return;
         }
         log(Log.INFO, TAG, "[v2] found " + target.toGenericString() + " (key=" + key + ")");
         hook(target).intercept(chain -> {
-            // 限流：首次被调用时打印，确认 hook 生效
-            if (CALL_LOG.add(HOOK_CLASS + "." + HOOK_METHOD)) {
-                log(Log.INFO, TAG, "[v2] CALLED: " + HOOK_CLASS + "." + HOOK_METHOD);
+            if (CALL_LOG.add(className + "." + HOOK_METHOD)) {
+                log(Log.INFO, TAG, "[v2] CALLED: " + className + "." + HOOK_METHOD);
             }
             // ★ 官方 API 102：getArgs() 返回不可变 List，无 setArgs；
             //   改参数必须走 proceed(newArgs) 传入新参数数组
@@ -131,7 +138,7 @@ public class XposedEntry extends XposedModule {
             }
             return chain.proceed();
         });
-        log(Log.INFO, TAG, "[v2] hook installed: " + HOOK_CLASS + "." + HOOK_METHOD);
+        log(Log.INFO, TAG, "[v2] hook installed: " + className + "." + HOOK_METHOD);
     }
 
     private void scheduleRehook(ClassLoader cl) {
@@ -139,7 +146,9 @@ public class XposedEntry extends XposedModule {
             try {
                 Thread.sleep(4000);
                 log(Log.INFO, TAG, "[v2] rehook round, loader=" + System.identityHashCode(cl));
-                hookEvaluateJavascript(cl);
+                for (String cn : HOOK_CLASSES) {
+                    hookConcreteClass(cn, cl);
+                }
             } catch (Throwable ignored) {
             }
         }, "wxgm-rehook");
