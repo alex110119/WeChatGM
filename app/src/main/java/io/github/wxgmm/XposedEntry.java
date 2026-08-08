@@ -5,42 +5,51 @@ import android.util.Log;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.HashSet;
 import java.util.Set;
 
 /**
- * WxGM v7：hook e3.c()（JsValidationInjector 队列末尾字符串请求），bundle.js 之后注入。
+ * WxGM v8：hook pf.a（SourceMapUtil），p1 判断 bundle.js 作为启用条件注入 PAYLOAD。
  *
- * v6 教训（xref 实证）：e3.h 只在无 v8 路径被 service.f.h 调用；8.0.76 有 libmmv8
- *   → evaluateScriptFile 走 k()（有 v8）→ e3.b → 队尾 e3.c()。v6 hook e3.h 偏离实际路径。
+ * v7 教训（日志实证 + 用户指正）：hook e3.c()（无参队尾工厂）CALLED=0——
+ *   无参拿不到 JS 文件名，无法判断"这次加载的是不是 macro 所在文件"。
+ *   正确启用条件 = pf.a 的 p1 参数（JS 文件名）：判断是否 bundle.js。
  *
- * MT 静态定位（base.apk 8.0.76）：
- *   service.f.evaluateScriptFile(int, String):
- *     t.h0(l0.class) → u
- *     ├─ u == null → log "without v8" → f()读内容 → service.f.h(...)  [无v8路径]
- *     └─ u != null → service.f.k(...) → e3.b(f9,t,key,paths[],b3)     [有v8路径★]
- *          ├─ v7 = pf.a(...) sourcemap（scriptType=3）
- *          ├─ v8 = e3.d(...) Wxa 文件（scriptType=2，含 bundle.js）
- *          ├─ e3.c() → V8ScriptEvaluateRequest{scriptType=3,
- *          │     scriptText="\n;(function(){return 0x2b67;})();"}   ← 队列末尾!★hook点
- *          └─ l0.l0(队列) 批量执行（e3.c 请求最后执行 → bundle.js 之后 → macro 已注册）
+ * MT 静态定位（base.apk 8.0.76，e3.b 内部遍历 paths 时逐文件调用）：
+ *   e3.b(f9, t, key, paths[], b3):
+ *     遍历 paths[]（每个 JS 文件一轮）:
+ *       v13 = pf.a(runtime, jsPath, 前缀)   ← p1=jsPath（JS 文件名）！
+ *       if 非空: V8ScriptEvaluateRequest{scriptText=v13, scriptType=3} → v7 队列
+ *       e3.d(jsPath, x3, ...) → Wxa 文件请求 → v8 队列
+ *     合并 v7+v8+e3.c() → l0.l0(队列) 批量执行
  *
- * 注入方案：hook e3.c() 返回值，scriptText 追加 PAYLOAD（多轮注入 + 轮询等待 macro）。
+ * pf.a(AppBrandRuntime, String p1=jsPath, String p2) → String（sourcemap 注入代码）
+ *   log "hy: getting sourcemap %s, %s" (tag: MicroMsg.SourceMapUtil)
+ *
+ * 注入方案：
+ *   hook pf.a → intercept 里检查 p1（args[1]）是否含 "bundle.js"：
+ *     ★ 命中 = 微信即将执行 bundle.js 的时刻（macro 所在文件！）
+ *     proceed() 拿原返回值 → return 原值 + PAYLOAD
+ *     （★ API 102：Chain 无 setResult，intercept 的返回值即最终结果）
+ *   bundle.js 执行 → System.register("chunks:///_virtual/macro") → macro 注册
+ *   PAYLOAD 轮询命中 → macro.TEST = !0 成功（无需等注册，轮询天然覆盖）
  */
 public class XposedEntry extends XposedModule {
 
     private static final String TAG = "WxGM";
 
-    /** JsValidationInjector 队列末尾请求工厂（MT 实证，静态无参方法） */
-    private static final String INJECT_CLASS = "com.tencent.mm.plugin.appbrand.utils.e3";
-    private static final String INJECT_METHOD = "c";
+    /** SourceMapUtil：e3.b 遍历 JS 文件时逐文件调用（p1 = JS 文件名） */
+    private static final String HOOK_CLASS = "com.tencent.mm.plugin.appbrand.pf";
+    private static final String HOOK_METHOD = "a";
+    /** 启用条件：JS 文件名含 bundle.js（macro 模块注册所在文件） */
+    private static final String TRIGGER = "bundle.js";
+    /** p1 参数索引（pf.a(AppBrandRuntime, String p1, String p2)） */
+    private static final int PATH_ARG = 1;
 
     /**
      * 注入的 JS：轮询等待 macro 注册后设 TEST = !0（GM 门禁开启，!0=true）。
-     * e3.c() 每轮 JS 加载批次都会调用（含框架 JS），不能假设该轮 macro 已注册——
-     * setInterval 每 50ms 检查，macro 可用或 System.import 成功即设值（最多 10 秒）。
+     * 命中 bundle.js 时刻注入 → bundle.js 执行后 macro 注册 → 轮询命中。
      */
     private static final String PAYLOAD =
             "\n;(function(){var n=0,d=false;var t=setInterval(function(){n++;" +
@@ -53,7 +62,7 @@ public class XposedEntry extends XposedModule {
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
-        log(Log.INFO, TAG, "[v7] module loaded, proc=" + param.getProcessName());
+        log(Log.INFO, TAG, "[v8] module loaded, proc=" + param.getProcessName());
     }
 
     @Override
@@ -61,7 +70,7 @@ public class XposedEntry extends XposedModule {
         if (!"com.tencent.mm".equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "[v7] package loaded (first=" + param.isFirstPackage() + ")");
+        log(Log.INFO, TAG, "[v8] package loaded (first=" + param.isFirstPackage() + ")");
     }
 
     @Override
@@ -70,97 +79,80 @@ public class XposedEntry extends XposedModule {
             return;
         }
         ClassLoader cl = param.getClassLoader();
-        log(Log.INFO, TAG, "[v7] package ready, hooking " + INJECT_CLASS + "." + INJECT_METHOD
+        log(Log.INFO, TAG, "[v8] package ready, hooking " + HOOK_CLASS + "." + HOOK_METHOD
                 + " loader=" + System.identityHashCode(cl));
         try {
-            hookTailRequest(cl);
+            hookSourceMap(cl);
             scheduleRehook(cl);
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "[v7] hook failed: " + t);
+            log(Log.ERROR, TAG, "[v8] hook failed: " + t);
             log(Log.ERROR, TAG, Log.getStackTraceString(t));
         }
     }
 
-    /** hook e3.c()：after 改返回值 scriptText，追加 PAYLOAD（多轮注入，队列末尾=bundle.js 之后） */
-    private void hookTailRequest(ClassLoader cl) {
-        String key = INJECT_CLASS + "@" + System.identityHashCode(cl) + "." + INJECT_METHOD;
+    /** hook pf.a：p1 含 bundle.js 时改返回值（追加 PAYLOAD），启用条件 = bundle.js 时刻 */
+    private void hookSourceMap(ClassLoader cl) {
+        String key = HOOK_CLASS + "@" + System.identityHashCode(cl) + "." + HOOK_METHOD;
         if (!HOOKED_KEYS.add(key)) {
-            log(Log.INFO, TAG, "[v7] already hooked, skip: " + key);
+            log(Log.INFO, TAG, "[v8] already hooked, skip: " + key);
             return;
         }
         Class<?> clazz;
         try {
-            clazz = Class.forName(INJECT_CLASS, false, cl);
+            clazz = Class.forName(HOOK_CLASS, false, cl);
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "[v7] class not found yet: " + INJECT_CLASS + " -> " + t);
+            log(Log.WARN, TAG, "[v8] class not found yet: " + HOOK_CLASS + " -> " + t);
             HOOKED_KEYS.remove(key);
             return;
         }
         Method target = null;
         for (Method m : clazz.getDeclaredMethods()) {
-            if (INJECT_METHOD.equals(m.getName()) && m.getParameterTypes().length == 0) {
+            // pf.a(AppBrandRuntime, String, String) → String（静态）
+            if (HOOK_METHOD.equals(m.getName())
+                    && m.getParameterTypes().length == 3
+                    && m.getParameterTypes()[PATH_ARG] == String.class
+                    && m.getReturnType() == String.class) {
                 target = m;
                 break;
             }
         }
         if (target == null) {
-            log(Log.WARN, TAG, "[v7] method not found: " + INJECT_CLASS + "." + INJECT_METHOD + "()");
+            log(Log.WARN, TAG, "[v8] method not found: " + HOOK_CLASS + "." + HOOK_METHOD
+                    + "(AppBrandRuntime, String, String):String");
             HOOKED_KEYS.remove(key);
             return;
         }
-        log(Log.INFO, TAG, "[v7] found " + target.toGenericString());
+        log(Log.INFO, TAG, "[v8] found " + target.toGenericString());
         hook(target).intercept(chain -> {
-            if (CALL_LOG.add(INJECT_CLASS + "." + INJECT_METHOD)) {
-                log(Log.INFO, TAG, "[v7] CALLED: " + INJECT_CLASS + "." + INJECT_METHOD
-                        + " (队列末尾请求工厂触发)");
+            if (CALL_LOG.add(HOOK_CLASS + "." + HOOK_METHOD)) {
+                log(Log.INFO, TAG, "[v8] CALLED: " + HOOK_CLASS + "." + HOOK_METHOD
+                        + " (sourcemap 获取触发)");
             }
-            Object result = chain.proceed();
-            // after：改返回值 scriptText = 原值 + PAYLOAD。
-            // ★ 多轮注入：e3.c() 每轮 JS 加载批次（框架加载、小游戏加载...）都会调用，
-            //   每轮都注入——框架加载那轮轮询可能超时（macro 未注册），小游戏那轮必成功。
-            if (result != null) {
-                try {
-                    Field f = findField(result.getClass(), "scriptText");
-                    if (f == null) {
-                        log(Log.WARN, TAG, "[v7] scriptText field not found on "
-                                + result.getClass().getName());
-                        return result;
-                    }
-                    f.setAccessible(true);
-                    Object origObj = f.get(result);
-                    String orig = origObj == null ? "" : String.valueOf(origObj);
-                    String injected = orig + PAYLOAD;
-                    f.set(result, injected);
-                    log(Log.INFO, TAG, "[v7] injected payload (scriptText len "
-                            + orig.length() + " -> " + injected.length() + ")");
-                } catch (Throwable t) {
-                    log(Log.ERROR, TAG, "[v7] inject failed: " + t);
-                }
+            // 启用条件：p1（jsPath）含 bundle.js → 微信即将执行 bundle.js（macro 所在文件）
+            Object pathObj = chain.getArg(PATH_ARG);
+            if (pathObj instanceof String && ((String) pathObj).contains(TRIGGER)) {
+                log(Log.INFO, TAG, "[v8] TRIGGERED by jsPath=" + pathObj
+                        + " (macro 所在文件，注入 PAYLOAD)");
+                // ★ API 102：Chain 无 setResult，intercept 返回值 = 最终返回值
+                //   proceed() 拿原返回值（sourcemap 代码），追加 PAYLOAD 后 return
+                Object result = chain.proceed();
+                String orig = result == null ? "" : String.valueOf(result);
+                String injected = orig + PAYLOAD;
+                log(Log.INFO, TAG, "[v8] injected payload (ret len "
+                        + orig.length() + " -> " + injected.length() + ")");
+                return injected;
             }
-            return result;
+            return chain.proceed();
         });
-        log(Log.INFO, TAG, "[v7] hook installed: " + INJECT_CLASS + "." + INJECT_METHOD);
-    }
-
-    /** 反射查找 scriptText 字段（含父类） */
-    private Field findField(Class<?> clazz, String name) {
-        Class<?> c = clazz;
-        while (c != null) {
-            try {
-                return c.getDeclaredField(name);
-            } catch (NoSuchFieldException ignored) {
-            }
-            c = c.getSuperclass();
-        }
-        return null;
+        log(Log.INFO, TAG, "[v8] hook installed: " + HOOK_CLASS + "." + HOOK_METHOD);
     }
 
     private void scheduleRehook(ClassLoader cl) {
         Thread t = new Thread(() -> {
             try {
                 Thread.sleep(4000);
-                log(Log.INFO, TAG, "[v7] rehook round, loader=" + System.identityHashCode(cl));
-                hookTailRequest(cl);
+                log(Log.INFO, TAG, "[v8] rehook round, loader=" + System.identityHashCode(cl));
+                hookSourceMap(cl);
             } catch (Throwable ignored) {
             }
         }, "wxgm-rehook");
