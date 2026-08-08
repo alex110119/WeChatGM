@@ -3,45 +3,35 @@
 微信小游戏 GM 面板注入的 **LibXposed API 102** 模块（LSPosed）。
 
 - 目标：微信 `com.tencent.mm`（8.0.76 测试目标）
-- 原理：hook 微信 AppBrand JS 引擎的 evaluate 方法 → 注入 payload → 等待 Cocos `System` 就绪 → hook `LayerManager.prototype.open` → 打开 `UITest`（UIID = 4，即 GM 面板）
+- 原理：hook 微信高层 JS 执行入口 `com.tencent.mm.plugin.appbrand.jsruntime.c0.evaluateJavascript(String, ValueCallback)` → 追加注入 JS → 设置 `macro.TEST = !0`（GM 门禁开启）→ 配合游戏内金币连点 ×3 触发 GM 面板（`gui.open(4)` / UITest，PC 已验证）
+
+## 注入点（8.0.76 已坐实）
+
+```
+com.tencent.mm.plugin.appbrand.jsruntime.c0.evaluateJavascript(String js, ValueCallback cb)
+```
+
+- 游戏跑在 appbrand 子进程，LSPosed 自动注入，模块无需进程判断
+- hook 后把原 JS 追加 PAYLOAD 再 `chain.proceed(newArgs)` 执行
+- PAYLOAD：先试全局 `macro.TEST=!0`，失败走 `System.import('chunks:///_virtual/macro').then(m=>m.TEST=!0)` 兜底
+- `!1`=false=关闭，`!0`=true=开启（PC DevTools 验证过 `gui.open` 触发链）
 
 ## 构建
 
-推送到 GitHub 后由 `.github/workflows/build.yml` 自动编译，产物在 Actions → Build APK → Artifacts（`WeChatGM-debug`）。
-
-本地不构建（无需 Android SDK）。
+推送到 GitHub 后由 `.github/workflows/build.yml` 自动编译，产物在 Actions → Build APK → Artifacts（`WeChatGM-debug`）。本地也可 `gradle assembleDebug`（需 Android SDK + JDK 17）。
 
 ## 安装
 
 1. 手机安装 **LSPosed**（Zygisk 版，需 root）
 2. 安装编译出的 APK，在 LSPosed 管理器中启用模块，勾选作用域 **微信（com.tencent.mm）**
-3. 重启微信，打开任意小游戏
-4. 观察 LSPosed 日志（tag `WxGM`）：
-   - `[probe] loaded class: ...` 会列出微信加载的 JS 运行时相关类名
-   - `[hook] ...evaluate...` 表示已 hook 到引擎求值方法
-   - `payload injected` 表示注入成功
-   - 游戏内打开任意面板（设置/商城等）即会自动触发 GM 面板（`LayerManager.open` 被 hook，调用 `open(4)`）
-
-## 工作机制 / 下一步
-
-微信 Android 版内部类名混淆且随版本变化，本模块第一版以**探测为主**：
-
-- `CANDIDATE_CLASSES` 是一组候选 JS 引擎类名，命中即 hook
-- `hookClassLoaderProbe()` 会动态记录所有 appbrand/js/v8 相关类名到日志
-- 跑一次后把日志里的 `[probe] loaded class` 贴回来，可进一步把真实类名写进候选列表，实现精确注入
-
-## 注入 payload（对应 PC devtools 验证过的路径）
-
-```js
-G.System.import('chunks:///_virtual/LayerManager.ts').then(m => {
-  const orig = m.LayerManager.prototype.open;
-  m.LayerManager.prototype.open = function (t, e, n) {
-    const r = orig.apply(this, arguments);
-    try { orig.call(this, 4); } catch (err) {}   // UIID 4 = UITest (GM)
-    return r;
-  };
-});
-```
+3. 重启微信，打开小游戏
+4. 观察 LSPosed 日志（tag `WxGM`）逐级确认：
+   - `[v2] module loaded` / `[v2] package ready` → 模块注入成功
+   - `[v2] hook installed: ...c0.evaluateJavascript` → hook 装上
+   - `[v2] CALLED: ...c0.evaluateJavascript` → hook 被触发
+   - `[v2] injecting payload (len X -> Y)` → 注入执行
+   - JS 侧 `[WxGM] macro.TEST set OK` / `via System OK` → 标志位设置成功
+5. 游戏内金币连点 ×3 → GM 面板（UITest）弹出
 
 ## 免责声明
 
