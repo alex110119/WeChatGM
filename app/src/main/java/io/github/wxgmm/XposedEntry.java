@@ -5,57 +5,53 @@ import android.util.Log;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.HashSet;
 import java.util.Set;
 
 /**
- * WxGM v2：直接 hook 微信高层 JS 执行入口，注入自己的 JS 代码。
+ * WxGM v4：hook JsValidationInjector 队列末尾请求（e3.c），在 bundle.js 之后注入 payload。
  *
- * 推翻 v1（hook mmv8.V8 的 execute*Script，已被证伪——8.0.76 小游戏 JS 不走那些入口）。
+ * v3 教训（用户指出 + MT 实证）：hook h()/evaluateScriptFile 时机仍不对——
+ *   h() 是无 v8 路径（8.0.76 有 v8 走 k()→e3.b）；且必须保证 bundle.js 先执行
+ *   （macro 在 bundle.js 注册，bundle.js 不执行则 macro 不存在，System.import 失败）。
  *
- * 已坐实的调用链（本次会话逐一验证 + MT 静态定位 base.apk）：
- *   - 游戏跑在 appbrand 子进程（LSPosed 自动注入，无需进程判断）
- *   - 微信高层 JS 执行入口接口 = com.tencent.mm.plugin.appbrand.jsruntime.c0
- *     .evaluateJavascript(String js, ValueCallback cb) : void
- *   - ★ c0 是 interface abstract（classHeader 实证），libxposed 禁止 hook 抽象方法
- *     → 必须 hook 具体实现类。MT 静态定位实现 c0 的具体类：
- *       cl.c3（public evaluateJavascript, 7 指令）/ cl.f3（public, 6 指令）
- *   - 参数 js 即要执行的 JS 源码 → hook 后替换/追加自己的 JS 即可执行
+ * MT 静态定位（base.apk 8.0.76，JsValidationInjector = e3.b，日志 tag
+ *   MicroMsg.JsValidationInjectorWC）：
+ *   e3.b(f9, t, key, paths[], b3) 批量注入用户 JS 文件:
+ *     ├─ v7 = pf.a(...) sourcemap 请求（scriptType=3）
+ *     ├─ v8 = e3.d(...) Wxa 文件请求（scriptType=2，含 bundle.js 内容）
+ *     ├─ e3.c() → V8ScriptEvaluateRequest{scriptType=3,
+ *     │     scriptText="\n;(function(){return 0x2b67;})();"}   ← 队列末尾!
+ *     └─ l0.l0(v0) 批量执行（e3.c 请求最后执行 → bundle.js 之后 → macro 已注册）
  *
- * 注入目标（GM 开关）：macro.TEST = !0  （模块导出对象属性，PC 已验证 gui.open 触发）
+ * 注入方案：hook e3.c() 返回值，在 scriptText 后追加 PAYLOAD。
+ *   bundle.js 执行完（macro 注册）→ 最后执行我们的 PAYLOAD → macro.TEST = !0 成功。
  */
 public class XposedEntry extends XposedModule {
 
     private static final String TAG = "WxGM";
 
-    /**
-     * 目标：c0 接口的【具体实现类】（MT 静态定位，非抽象方法，可 hook）。
-     * cl.c3 / cl.f3 都是 public evaluateJavascript(String, ValueCallback)。
-     */
-    private static final String[] HOOK_CLASSES = {
-            "cl.c3",
-            "cl.f3",
-    };
-    private static final String HOOK_METHOD = "evaluateJavascript";
+    /** JsValidationInjector 队列末尾请求工厂（MT 实证，静态无参方法） */
+    private static final String INJECT_CLASS = "com.tencent.mm.plugin.appbrand.utils.e3";
+    private static final String INJECT_METHOD = "c";
+    /** 返回类型：V8ScriptEvaluateRequest（scriptText 字段可注入） */
+    private static final String REQ_CLASS = "com.eclipsesource.mmv8.V8ScriptEvaluateRequest";
 
-    /**
-     * 注入的 JS 代码（追加到原 JS 末尾执行）。
-     * 先尝试直接改全局 macro（PC DevTools 可访问），失败再走 System.import 模块系统。
-     * !0 = true（开启 GM 门禁）
-     */
+    /** 注入的 JS：macro.TEST = !0（GM 门禁开启，!0=true；bundle.js 后执行，macro 已注册） */
     private static final String PAYLOAD =
-            ";try{macro.TEST=!0;console.log('[WxGM] macro.TEST set OK')}catch(e){" +
-            "try{System.import('chunks:///_virtual/macro').then(function(m){m.TEST=!0;console.log('[WxGM] macro.TEST via System OK')})}catch(e2){console.log('[WxGM] inject fail '+e2)}}";
+            "\n;(function(){try{macro.TEST=!0;console.log('[WxGM] macro.TEST set OK')}catch(e){" +
+            "try{System.import('chunks:///_virtual/macro').then(function(m){m.TEST=!0;console.log('[WxGM] macro.TEST via System OK')})}catch(e2){console.log('[WxGM] inject fail '+e2)}}})();";
 
-    /** 已 hook 的方法 key（含 classloader 身份：不同 loader 的类副本要各自 hook，避免漏掉运行时实际使用的副本） */
     private static final Set<String> HOOKED_KEYS = new HashSet<>();
-    /** 限流调用日志：每个方法首次被调用时打印，验证 hook 是否真的触发 */
     private static final Set<String> CALL_LOG = new HashSet<>();
+    private static final java.util.concurrent.atomic.AtomicBoolean INJECTED =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
-        log(Log.INFO, TAG, "[v2] module loaded, proc=" + param.getProcessName());
+        log(Log.INFO, TAG, "[v4] module loaded, proc=" + param.getProcessName());
     }
 
     @Override
@@ -63,7 +59,7 @@ public class XposedEntry extends XposedModule {
         if (!"com.tencent.mm".equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "[v2] package loaded (first=" + param.isFirstPackage() + ")");
+        log(Log.INFO, TAG, "[v4] package loaded (first=" + param.isFirstPackage() + ")");
     }
 
     @Override
@@ -72,83 +68,96 @@ public class XposedEntry extends XposedModule {
             return;
         }
         ClassLoader cl = param.getClassLoader();
-        log(Log.INFO, TAG, "[v2] package ready, hooking " + String.join("/", HOOK_CLASSES)
-                + "." + HOOK_METHOD + " loader=" + System.identityHashCode(cl));
+        log(Log.INFO, TAG, "[v4] package ready, hooking " + INJECT_CLASS + "." + INJECT_METHOD
+                + " loader=" + System.identityHashCode(cl));
         try {
-            for (String cn : HOOK_CLASSES) {
-                hookConcreteClass(cn, cl);
-            }
-            // 延时再 hook 一轮：appbrand 子进程的类可能是 tinker 补丁 classloader 加载的副本
+            hookTailRequest(cl);
             scheduleRehook(cl);
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "[v2] hook failed: " + t);
+            log(Log.ERROR, TAG, "[v4] hook failed: " + t);
             log(Log.ERROR, TAG, Log.getStackTraceString(t));
         }
     }
 
-    /** 对具体实现类 hook evaluateJavascript（具体方法，非抽象，可 hook） */
-    private void hookConcreteClass(String className, ClassLoader cl) {
-        Class<?> clazz = null;
-        try {
-            clazz = Class.forName(className, false, cl);
-        } catch (Throwable t) {
-            log(Log.WARN, TAG, "[v2] class not found yet: " + className + " -> " + t);
+    /** hook e3.c()：after 改返回值 scriptText，追加 PAYLOAD（队列末尾 = bundle.js 之后） */
+    private void hookTailRequest(ClassLoader cl) {
+        String key = INJECT_CLASS + "@" + System.identityHashCode(cl) + "." + INJECT_METHOD;
+        if (!HOOKED_KEYS.add(key)) {
+            log(Log.INFO, TAG, "[v4] already hooked, skip: " + key);
             return;
         }
-        String key = className + "@" + System.identityHashCode(cl) + "." + HOOK_METHOD;
-        if (!HOOKED_KEYS.add(key)) {
-            log(Log.INFO, TAG, "[v2] already hooked, skip: " + key);
+        Class<?> clazz;
+        try {
+            clazz = Class.forName(INJECT_CLASS, false, cl);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "[v4] class not found yet: " + INJECT_CLASS + " -> " + t);
+            HOOKED_KEYS.remove(key);
             return;
         }
         Method target = null;
         for (Method m : clazz.getDeclaredMethods()) {
-            if (HOOK_METHOD.equals(m.getName())
-                    && !java.lang.reflect.Modifier.isAbstract(m.getModifiers())) {
+            if (INJECT_METHOD.equals(m.getName()) && m.getParameterTypes().length == 0) {
                 target = m;
                 break;
             }
         }
         if (target == null) {
-            log(Log.WARN, TAG, "[v2] concrete method not found: " + className + "." + HOOK_METHOD
-                    + " (may still be abstract)");
+            log(Log.WARN, TAG, "[v4] method not found: " + INJECT_CLASS + "." + INJECT_METHOD + "()");
             HOOKED_KEYS.remove(key);
             return;
         }
-        log(Log.INFO, TAG, "[v2] found " + target.toGenericString() + " (key=" + key + ")");
+        log(Log.INFO, TAG, "[v4] found " + target.toGenericString());
         hook(target).intercept(chain -> {
-            if (CALL_LOG.add(className + "." + HOOK_METHOD)) {
-                log(Log.INFO, TAG, "[v2] CALLED: " + className + "." + HOOK_METHOD);
+            if (CALL_LOG.add(INJECT_CLASS + "." + INJECT_METHOD)) {
+                log(Log.INFO, TAG, "[v4] CALLED: " + INJECT_CLASS + "." + INJECT_METHOD
+                        + " (队列末尾请求工厂触发)");
             }
-            // ★ 官方 API 102：getArgs() 返回不可变 List，无 setArgs；
-            //   改参数必须走 proceed(newArgs) 传入新参数数组
-            java.util.List<Object> args = chain.getArgs();
-            if (args != null && !args.isEmpty() && args.get(0) instanceof String) {
-                String orig = (String) args.get(0);
-                if (orig != null) {
-                    String injected = orig + PAYLOAD;
-                    Object[] newArgs = new Object[args.size()];
-                    newArgs[0] = injected;
-                    for (int i = 1; i < args.size(); i++) {
-                        newArgs[i] = args.get(i);
+            Object result = chain.proceed();
+            // after：改返回值 scriptText = 原值 + PAYLOAD
+            if (!INJECTED.get() && result != null) {
+                try {
+                    Field f = findField(result.getClass(), "scriptText");
+                    if (f == null) {
+                        log(Log.WARN, TAG, "[v4] scriptText field not found on "
+                                + result.getClass().getName());
+                        return result;
                     }
-                    log(Log.INFO, TAG, "[v2] injecting payload (len " + orig.length()
-                            + " -> " + injected.length() + ")");
-                    return chain.proceed(newArgs);
+                    f.setAccessible(true);
+                    Object origObj = f.get(result);
+                    String orig = origObj == null ? "" : String.valueOf(origObj);
+                    String injected = orig + PAYLOAD;
+                    f.set(result, injected);
+                    log(Log.INFO, TAG, "[v4] injected payload (scriptText len "
+                            + orig.length() + " -> " + injected.length() + ")");
+                    INJECTED.set(true);
+                } catch (Throwable t) {
+                    log(Log.ERROR, TAG, "[v4] inject failed: " + t);
                 }
             }
-            return chain.proceed();
+            return result;
         });
-        log(Log.INFO, TAG, "[v2] hook installed: " + className + "." + HOOK_METHOD);
+        log(Log.INFO, TAG, "[v4] hook installed: " + INJECT_CLASS + "." + INJECT_METHOD);
+    }
+
+    /** 反射查找 scriptText 字段（含父类） */
+    private Field findField(Class<?> clazz, String name) {
+        Class<?> c = clazz;
+        while (c != null) {
+            try {
+                return c.getDeclaredField(name);
+            } catch (NoSuchFieldException ignored) {
+            }
+            c = c.getSuperclass();
+        }
+        return null;
     }
 
     private void scheduleRehook(ClassLoader cl) {
         Thread t = new Thread(() -> {
             try {
                 Thread.sleep(4000);
-                log(Log.INFO, TAG, "[v2] rehook round, loader=" + System.identityHashCode(cl));
-                for (String cn : HOOK_CLASSES) {
-                    hookConcreteClass(cn, cl);
-                }
+                log(Log.INFO, TAG, "[v4] rehook round, loader=" + System.identityHashCode(cl));
+                hookTailRequest(cl);
             } catch (Throwable ignored) {
             }
         }, "wxgm-rehook");
