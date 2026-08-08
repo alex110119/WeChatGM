@@ -11,13 +11,17 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * WxGM v13：hook jsruntime.q.evaluateJavascript + deoptimize，PAYLOAD 轮询注入 macro.TEST=!0。
+ * WxGM v14：hook jsruntime.n.evaluateJavascript + deoptimize，PAYLOAD 轮询注入 macro.TEST=!0。
+ *
+ * v13 修正（日志实证 220140/220157）：method not found: jsruntime.q.evaluateJavascript——
+ *   jsruntime.q 继承 jsruntime.n 未 override，getDeclaredMethods 找不到（只返回本类声明）。
+ *   → ★ hook 声明处 jsruntime.n（MT smali 实证其 evaluateJavascript 是具体方法，可 hook）
  *
  * 定位结论（MT 静态 + 运行时实证）：
  *   - 小游戏跑在 appbrand 进程，逻辑层 JS 经 V8（libmmv8）执行
  *   - 微信注入链：na1/x.k → service.f.k → e3.b → batchExecuteScripts → V8
  *   - na1/x.k 内部 invoke-virtual jsruntime.n.evaluateJavascript(String, ValueCallback)
- *     ↑ 实际实例 = jsruntime.q（final 具体类，extends abstract jsruntime.n，可 hook）
+ *   - jsruntime.n.evaluateJavascript 内部: n0()→cl.q0（引擎）→ cl.q0.d(JS内容, cl.j1) 执行
  *   - bundle.js（macro 注册）经 Cocos System 模块系统 JS 侧加载
  *
  * v12 教训（日志实证 + 用户锁定的 B）：此前 CALLED=0 因短方法被内联
@@ -26,7 +30,7 @@ import java.util.Set;
  *   → ★ deoptimize 是生效条件，必须调用
  *
  * 注入方案：
- *   ① hook jsruntime.q.evaluateJavascript(String, ValueCallback)
+ *   ① hook jsruntime.n.evaluateJavascript(String, ValueCallback)（具体方法，声明处）
  *      args[0]（JS 内容）含 "_virtual/macro" 或 "bundle.js"（macro 注册特征）→ 追加 PAYLOAD
  *   ② ★ deoptimize(target)（官方 XposedInterface 方法，防内联）
  *   ③ PAYLOAD 轮询等 macro 注册 → macro.TEST=!0（GM 门禁开启）
@@ -43,8 +47,14 @@ public class XposedEntry extends XposedModule {
 
     private static final String TAG = "WxGM";
 
-    /** 逻辑层 JS 执行实现类（final 具体类，extends abstract jsruntime.n；MT 实证） */
-    private static final String HOOK_CLASS = "com.tencent.mm.plugin.appbrand.jsruntime.q";
+    /**
+     * 逻辑层 JS 执行实现类（MT 实证）：
+     *   jsruntime.n.evaluateJavascript(String, ValueCallback) 是【具体方法】（非抽象，可 hook）
+     *   内部: n0() → cl.q0（引擎）→ cl.q0.d(JS内容, cl.j1回调) 执行
+     *   jsruntime.q 继承 n 未 override → getDeclaredMethods 找不到（v13 method not found 根因）
+     *   ★ hook 声明处 jsruntime.n（子类实例调用时同样走 n 的实现）
+     */
+    private static final String HOOK_CLASS = "com.tencent.mm.plugin.appbrand.jsruntime.n";
     private static final String HOOK_METHOD = "evaluateJavascript";
     /** 注入判定特征：JS 内容含 macro 模块注册（chunks:///_virtual/macro）或 bundle.js */
     private static final String MACRO_HINT = "_virtual/macro";
