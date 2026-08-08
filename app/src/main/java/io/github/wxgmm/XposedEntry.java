@@ -82,14 +82,43 @@ public class XposedEntry extends XposedModule {
         if (!"com.tencent.mm".equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "[v10] package ready, hooking ClassLoader.loadClass"
-                + " loader=" + System.identityHashCode(param.getClassLoader()));
+        ClassLoader cl = param.getClassLoader();
+        log(Log.INFO, TAG, "[v10] package ready, hooking ClassLoader.loadClass + preloaded try"
+                + " loader=" + System.identityHashCode(cl));
         try {
             hookLoadClassInterceptor();
+            // ★ 覆盖已预加载的类：onPackageReady 时若 pf/e3 已被微信加载，
+            //   loadClass 拦截不会再捕获 → 主动 forName 一次；未加载则等拦截延迟捕获
+            tryHookPreloaded(cl);
             scheduleRehook();
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "[v10] hook failed: " + t);
             log(Log.ERROR, TAG, Log.getStackTraceString(t));
+        }
+    }
+
+    /**
+     * ★ 加载顺序兜底：pf/e3 类若在 onPackageReady 之前已被微信预加载，
+     *   loadClass 拦截永远捕获不到（不会再次加载）——这里主动 forName 试 hook；
+     *   若类未加载（抛 ClassNotFoundException）则等 loadClass 拦截在加载时捕获。
+     *   hookSourceMap/hookTailRequest 内部按 clazz.getClassLoader() 去重，双路径幂等。
+     */
+    private void tryHookPreloaded(ClassLoader cl) {
+        try {
+            Class<?> pf = Class.forName(SM_CLASS, false, cl);
+            log(Log.INFO, TAG, "[v10] pf 类已预加载 loader="
+                    + System.identityHashCode(pf.getClassLoader()));
+            hookSourceMap(pf);
+        } catch (Throwable t) {
+            log(Log.INFO, TAG, "[v10] pf 类未预加载（等 loadClass 拦截）: " + t);
+        }
+        try {
+            Class<?> e3 = Class.forName(TAIL_CLASS, false, cl);
+            log(Log.INFO, TAG, "[v10] e3 类已预加载 loader="
+                    + System.identityHashCode(e3.getClassLoader()));
+            hookTailRequest(e3);
+        } catch (Throwable t) {
+            log(Log.INFO, TAG, "[v10] e3 类未预加载（等 loadClass 拦截）: " + t);
         }
     }
 
